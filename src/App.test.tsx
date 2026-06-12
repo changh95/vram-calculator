@@ -69,15 +69,20 @@ describe('App', () => {
     expect(document.documentElement.getAttribute('data-theme')).toBe('light')
   })
 
-  it('keeps the verdict badge consistent with the per-device gauge when multiple devices are selected', async () => {
+  it('shows TOTAL usage vs total capacity for multiple devices (2× 24 GB → 48 GB)', async () => {
     render(<App />)
-    // 2× RTX 4090 (24 GB each): the badge must read per-device (24 GB), matching
-    // the gauge/legend below it — not the 48 GB aggregate.
     await userEvent.selectOptions(screen.getByLabelText(/Hardware/), 'rtx-4090')
     await userEvent.click(screen.getByRole('button', { name: /increase devices/i }))
     const verdict = screen.getByRole('status').closest('div')!.parentElement!
-    expect(verdict).toHaveTextContent(/of 24\.0 GB usable/)
-    expect(verdict).not.toHaveTextContent(/of 48\.0 GB usable/)
+    expect(verdict).toHaveTextContent(/of 48\.0 GB usable/) // total, not per-device
+  })
+
+  it('shows TOTAL (not per-chip) memory for multi-chip Tenstorrent systems (8× 12 GB → 96 GB)', async () => {
+    render(<App />)
+    await userEvent.selectOptions(screen.getByLabelText(/Hardware/), 'tt-t3k') // 8 Wormhole chips × 12 GB
+    const verdict = screen.getByRole('status').closest('div')!.parentElement!
+    expect(verdict).toHaveTextContent(/of 96\.0 GB usable/) // total across the mesh
+    expect(verdict).not.toHaveTextContent(/of 12\.0 GB usable/) // not per-chip
   })
 
   it('lists Tenstorrent hardware first in the dropdown', () => {

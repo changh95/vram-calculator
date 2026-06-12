@@ -117,14 +117,17 @@ export default function App() {
   }
 
   // Aggregate breakdown, scaled to a per-device view so the gauge and legend
-  // both compare against per-device usable capacity and sum to perDeviceGb.
-  const factor = result.totalGb > 0 ? result.perDeviceGb / result.totalGb : 0
+  // Total (aggregate) memory: usage and capacity summed across all devices/chips.
+  // Even sharding makes total/total equal the per-chip ratio, so the verdict is
+  // unchanged — this is just the more intuitive "total used / total available" view.
   const parts: GaugePart[] = [
-    { id: 'weights', label: 'Weights', gb: result.weightsGb * factor },
-    { id: 'kv', label: 'KV cache', gb: result.kvCacheGb * factor },
-    { id: 'act', label: 'Activations', gb: result.activationsGb * factor },
-    { id: 'ovh', label: 'Overhead', gb: result.overheadGb * factor },
+    { id: 'weights', label: 'Weights', gb: result.weightsGb },
+    { id: 'kv', label: 'KV cache', gb: result.kvCacheGb },
+    { id: 'act', label: 'Activations', gb: result.activationsGb },
+    { id: 'ovh', label: 'Overhead', gb: result.overheadGb },
   ]
+  const ttHw = config.hardware.usableGbPerChip !== undefined
+  const unitCount = (ttHw ? (config.hardware.numChips ?? 1) : 1) * config.deviceCount
 
   const m = config.model
   const archLabel: Record<string, string> = {
@@ -207,18 +210,18 @@ export default function App() {
 
             <VerdictBadge
               verdict={result.verdict}
-              totalGb={result.perDeviceGb}
-              usableGb={result.usablePerDeviceGb}
-              shortfallGb={result.verdict === 'wont-fit' ? result.perDeviceGb - result.usablePerDeviceGb : null}
+              totalGb={result.totalGb}
+              usableGb={result.usableGb}
+              shortfallGb={result.shortfallGb}
             />
 
             <div className="mt-5">
-              <MemoryGauge parts={parts} usableGb={result.usablePerDeviceGb} />
+              <MemoryGauge parts={parts} usableGb={result.usableGb} />
             </div>
 
             <div className="mt-4 flex items-baseline justify-between">
               <h3 className="font-display text-[11px] font-semibold uppercase tracking-[0.12em] text-ink-faint">
-                Allocation{config.deviceCount > 1 ? ` · per device (×${config.deviceCount})` : ''}
+                Allocation{unitCount > 1 ? ` · total across ${unitCount} ${ttHw ? 'chips' : 'devices'}` : ''}
               </h3>
               <span className="font-display text-[11px] text-ink-faint">
                 {formatTokens(config.contextLength)} ctx · {config.framework.kvDtypeLabel} KV
