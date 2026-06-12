@@ -88,6 +88,12 @@ Tests are written **before** implementation, everywhere:
 - Full config encoded in the URL for shareable links.
 - Verdict never relies on color alone (icon + text); WCAG AA contrast;
   keyboard-navigable controls.
+- UI is internationalized (English / Korean / Simplified Chinese / Japanese) via
+  `src/lib/i18n.ts` — a top-right language dropdown, choice persisted to
+  localStorage. Only UI chrome/labels/verdict are translated; the lib modules
+  (`estimateVram`/`suggestions`) stay English and produce canonical English
+  assumption/suggestion text. Add new UI strings as keys in `i18n.ts` (the
+  `Record<TKey, string>` typing forces every language to define every key).
 - Dark mode default with light toggle. Visual direction:
   `reference/index-mock.html` is the *feel* reference — dense, technical,
   developer-tool aesthetic — but the real UI should elevate it (use the

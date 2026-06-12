@@ -6,6 +6,7 @@ import App from './App'
 beforeEach(() => {
   window.history.replaceState(null, '', '/')
   document.documentElement.removeAttribute('data-theme')
+  localStorage.clear() // reset persisted language between tests
 })
 
 describe('App', () => {
@@ -119,6 +120,15 @@ describe('App', () => {
     const before = screen.getByTestId('total-required').textContent
     await userEvent.selectOptions(screen.getByLabelText('Quantization'), 'q8_0')
     expect(screen.getByTestId('total-required').textContent).not.toBe(before)
+  })
+
+  it('switches UI language via the top-right dropdown', async () => {
+    render(<App />)
+    expect(screen.getByText('Configuration')).toBeInTheDocument()
+    await userEvent.selectOptions(screen.getByLabelText('Language'), 'ko')
+    expect(screen.getByText('구성')).toBeInTheDocument() // Configuration → Korean
+    expect(screen.queryByText('Configuration')).not.toBeInTheDocument()
+    expect(document.documentElement.lang).toBe('ko')
   })
 
   it('shows the unified-memory cap note for an Apple device', async () => {

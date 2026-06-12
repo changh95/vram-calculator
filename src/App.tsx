@@ -4,6 +4,7 @@ import { estimateVram } from './lib/estimateVram'
 import { suggestFixes, type Suggestion } from './lib/suggestions'
 import { parseConfigSearch, serializeConfigSearch, type ConfigSelection } from './lib/urlState'
 import { formatGb, formatTokens } from './lib/format'
+import { LANGUAGES, t, type Lang, type TKey } from './lib/i18n'
 import type { CalcConfig } from './lib/types'
 import { SelectField, type SelectGroup } from './components/SelectField'
 import { ContextSlider } from './components/ContextSlider'
@@ -88,6 +89,10 @@ export default function App() {
     parseConfigSearch(window.location.search, DEFAULTS),
   )
   const [theme, setTheme] = useState<'dark' | 'light'>('dark')
+  const [lang, setLang] = useState<Lang>(
+    () => (localStorage.getItem('vram-lang') as Lang) || 'en',
+  )
+  const tr = (key: TKey, params?: Record<string, string | number>) => t(lang, key, params)
 
   useEffect(() => {
     const qs = serializeConfigSearch(sel)
@@ -98,6 +103,11 @@ export default function App() {
     if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light')
     else document.documentElement.removeAttribute('data-theme')
   }, [theme])
+
+  useEffect(() => {
+    document.documentElement.lang = lang
+    localStorage.setItem('vram-lang', lang)
+  }, [lang])
 
   const config = useMemo(() => resolve(sel), [sel])
   const result = useMemo(() => estimateVram(config), [config])
@@ -120,19 +130,19 @@ export default function App() {
     else if (s.kind === 'hardware' && s.hardwareId) set({ hardwareId: s.hardwareId })
   }
 
-  // Aggregate breakdown, scaled to a per-device view so the gauge and legend
   // Total (aggregate) memory: usage and capacity summed across all devices/chips.
   // Even sharding makes total/total equal the per-chip ratio, so the verdict is
   // unchanged — this is just the more intuitive "total used / total available" view.
   const parts: GaugePart[] = [
-    { id: 'weights', label: 'Weights', gb: result.weightsGb },
-    { id: 'kv', label: 'KV cache', gb: result.kvCacheGb },
-    { id: 'act', label: 'Activations', gb: result.activationsGb },
-    { id: 'ovh', label: 'Overhead', gb: result.overheadGb },
+    { id: 'weights', label: tr('weights'), gb: result.weightsGb },
+    { id: 'kv', label: tr('kvCache'), gb: result.kvCacheGb },
+    { id: 'act', label: tr('activations'), gb: result.activationsGb },
+    { id: 'ovh', label: tr('overhead'), gb: result.overheadGb },
   ]
   const ttHw = config.hardware.usableGbPerChip !== undefined
   const unitCount =
     (ttHw ? (config.hardware.numChips ?? 1) : (config.hardware.gpusPerNode ?? 1)) * config.deviceCount
+  const unitKey: TKey = ttHw ? 'chips' : config.hardware.gpusPerNode ? 'gpus' : 'devicesUnit'
 
   const m = config.model
   const archLabel: Record<string, string> = {
@@ -147,19 +157,31 @@ export default function App() {
             <h1 className="font-display text-xl font-extrabold tracking-tight">
               VRAM<span className="text-accent">·</span>Calculator
             </h1>
-            <p className="mt-1 text-[13px] text-ink-dim">Can I run this model on my hardware?</p>
+            <p className="mt-1 text-[13px] text-ink-dim">{tr('tagline')}</p>
           </div>
           <div className="flex items-center gap-2">
             <span className="font-display rounded-full border border-edge bg-panel px-3 py-1.5 text-[11px] font-semibold text-ink-dim">
-              inference · estimate
+              {tr('inference')}
             </span>
+            <select
+              aria-label={tr('language')}
+              value={lang}
+              onChange={(e) => setLang(e.target.value as Lang)}
+              className="font-display cursor-pointer rounded-full border border-edge bg-panel px-3 py-1.5 text-[11px] font-semibold text-ink-dim outline-none transition-colors hover:border-accent hover:text-ink"
+            >
+              {LANGUAGES.map((l) => (
+                <option key={l.code} value={l.code}>
+                  {l.name}
+                </option>
+              ))}
+            </select>
             <button
               type="button"
               aria-label="Toggle theme"
               onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
               className="rounded-full border border-edge bg-panel px-3 py-1.5 text-[11px] font-semibold text-ink-dim transition-colors hover:border-accent hover:text-ink"
             >
-              {theme === 'dark' ? '☾ dark' : '☀ light'}
+              {theme === 'dark' ? `☾ ${tr('dark')}` : `☀ ${tr('light')}`}
             </button>
           </div>
         </header>
@@ -168,12 +190,12 @@ export default function App() {
           {/* CONFIG */}
           <section className="rounded-xl border border-edge bg-panel p-5">
             <h2 className="font-display mb-4 text-[11px] font-semibold uppercase tracking-[0.12em] text-ink-faint">
-              Configuration
+              {tr('configuration')}
             </h2>
             <div className="space-y-4">
-              <SelectField label="Model" hint={`${m.moe ? 'MoE' : 'dense'} · ${archLabel[m.attention.kind]}`} groups={MODEL_GROUPS} value={sel.modelId} onChange={(v) => set({ modelId: v })} />
+              <SelectField label={tr('model')} hint={`${m.moe ? 'MoE' : 'dense'} · ${archLabel[m.attention.kind]}`} groups={MODEL_GROUPS} value={sel.modelId} onChange={(v) => set({ modelId: v })} />
               <div>
-                <SelectField label="Hardware" hint="memory capacity" groups={HARDWARE_GROUPS} value={sel.hardwareId} onChange={(v) => set({ hardwareId: v })} />
+                <SelectField label={tr('hardware')} hint={tr('memoryCapacity')} groups={HARDWARE_GROUPS} value={sel.hardwareId} onChange={(v) => set({ hardwareId: v })} />
                 {config.hardware.buyUrl && (
                   <a
                     href={config.hardware.buyUrl}
@@ -181,24 +203,24 @@ export default function App() {
                     rel="noopener noreferrer"
                     className="font-display mt-2 inline-flex items-center gap-1.5 rounded-sm border border-accent/50 bg-accent/10 px-3 py-1.5 text-[11px] font-semibold text-accent transition-colors hover:bg-accent/20"
                   >
-                    Buy now <span aria-hidden="true">↗</span>
+                    {tr('buyNow')} <span aria-hidden="true">↗</span>
                   </a>
                 )}
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <SelectField
-                  label="Quantization"
-                  hint={config.hardware.usableGbPerChip !== undefined ? 'block-float profile' : 'bits / weight'}
-                  groups={config.hardware.usableGbPerChip !== undefined ? QUANT_GROUP_TT : QUANT_GROUP}
+                  label={tr('quantization')}
+                  hint={ttHw ? tr('blockFloatProfile') : tr('bitsWeight')}
+                  groups={ttHw ? QUANT_GROUP_TT : QUANT_GROUP}
                   value={config.quant.id}
                   onChange={(v) => set({ quantId: v })}
                 />
-                <SelectField label="Serving framework" hint="KV strategy" groups={FRAMEWORK_GROUP} value={sel.frameworkId} onChange={(v) => set({ frameworkId: v })} />
+                <SelectField label={tr('servingFramework')} hint={tr('kvStrategy')} groups={FRAMEWORK_GROUP} value={sel.frameworkId} onChange={(v) => set({ frameworkId: v })} />
               </div>
-              <ContextSlider label="Context length" presets={CONTEXT_PRESETS} value={sel.contextLength} onChange={(v) => set({ contextLength: v })} />
+              <ContextSlider label={tr('contextLength')} presets={CONTEXT_PRESETS} value={sel.contextLength} onChange={(v) => set({ contextLength: v })} />
               <div className="grid grid-cols-2 gap-x-6 gap-y-3 pt-1">
-                <Stepper label="Concurrent seqs" hint="continuous batch" value={sel.concurrentSequences} min={1} max={64} onChange={(v) => set({ concurrentSequences: v })} />
-                <Stepper label="Devices" hint={`× ${config.hardware.name.split(' ')[0]}`} value={sel.deviceCount} min={1} max={8} onChange={(v) => set({ deviceCount: v })} />
+                <Stepper label={tr('concurrentSeqs')} hint={tr('continuousBatch')} value={sel.concurrentSequences} min={1} max={64} onChange={(v) => set({ concurrentSequences: v })} />
+                <Stepper label={tr('devices')} hint={`× ${config.hardware.name.split(' ')[0]}`} value={sel.deviceCount} min={1} max={8} onChange={(v) => set({ deviceCount: v })} />
               </div>
             </div>
           </section>
@@ -206,7 +228,7 @@ export default function App() {
           {/* RESULTS */}
           <section className="rounded-xl border border-edge bg-panel p-5">
             <h2 className="font-display mb-4 text-[11px] font-semibold uppercase tracking-[0.12em] text-ink-faint">
-              Memory results
+              {tr('results')}
             </h2>
 
             <div data-testid="total-required" className="sr-only">
@@ -218,6 +240,14 @@ export default function App() {
               totalGb={result.totalGb}
               usableGb={result.usableGb}
               shortfallGb={result.shortfallGb}
+              labels={{
+                fits: tr('fits'),
+                tight: tr('tight'),
+                wontFit: tr('wontFit'),
+                required: tr('required'),
+                usable: tr('usable'),
+                overBy: tr('overBy'),
+              }}
             />
 
             <div className="mt-5">
@@ -226,7 +256,8 @@ export default function App() {
 
             <div className="mt-4 flex items-baseline justify-between">
               <h3 className="font-display text-[11px] font-semibold uppercase tracking-[0.12em] text-ink-faint">
-                Allocation{unitCount > 1 ? ` · total across ${unitCount} ${ttHw ? 'chips' : 'devices'}` : ''}
+                {tr('allocation')}
+                {unitCount > 1 ? ` · ${tr('totalAcross', { n: unitCount, unit: tr(unitKey) })}` : ''}
               </h3>
               <span className="font-display text-[11px] text-ink-faint">
                 {formatTokens(config.contextLength)} ctx · {config.framework.kvDtypeLabel} KV
@@ -239,21 +270,19 @@ export default function App() {
             {suggestions.length > 0 && (
               <div data-testid="suggestions" className="mt-5">
                 <h3 className="font-display mb-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-nofit">
-                  To make it fit
+                  {tr('toMakeFit')}
                 </h3>
                 <SuggestionChips suggestions={suggestions} onApply={applySuggestion} />
               </div>
             )}
 
             <div className="mt-5">
-              <AssumptionsList assumptions={result.assumptions} />
+              <AssumptionsList assumptions={result.assumptions} title={tr('assumptions')} />
             </div>
           </section>
         </div>
 
-        <footer className="mt-6 text-center text-[11px] text-ink-faint">
-          Estimates only — see <span className="text-ink-dim">notes/</span> for the formula and sources. Inference, single-node; training and offloading are out of scope.
-        </footer>
+        <footer className="mt-6 text-center text-[11px] text-ink-faint">{tr('footer')}</footer>
       </div>
     </div>
   )
