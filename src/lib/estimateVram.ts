@@ -235,22 +235,24 @@ export function estimateVram(config: CalcConfig): MemoryBreakdown {
   const activationsPerDevice =
     activationBytes(model.hiddenSize, contextLength, concurrentSequences, framework.activation) / GIB
 
-  // Tensor-parallel sharding model: a REPLICATED_WEIGHT_FRACTION copy of the
-  // weights lives on every device; the rest shards evenly. KV shards evenly;
-  // activations and the runtime baseline are paid per device.
-  const r = deviceCount > 1 ? REPLICATED_WEIGHT_FRACTION : 0
-  const perDeviceWeights = weights * ((1 - r) / deviceCount + r)
+  // Tensor-parallel sharding model over all GPUs: `gpusPerNode` (e.g. an 8-GPU
+  // HGX/DGX node) × deviceCount. A REPLICATED_WEIGHT_FRACTION copy of the weights
+  // lives on every GPU; the rest shards evenly. KV shards evenly; activations and
+  // the runtime baseline are paid per GPU. Verdict is judged per GPU.
+  const shards = deviceCount * (hardware.gpusPerNode ?? 1)
+  const r = shards > 1 ? REPLICATED_WEIGHT_FRACTION : 0
+  const perDeviceWeights = weights * ((1 - r) / shards + r)
   const perDeviceGb =
-    perDeviceWeights + kv / deviceCount + activationsPerDevice + framework.baselineOverheadGb
+    perDeviceWeights + kv / shards + activationsPerDevice + framework.baselineOverheadGb
 
-  // Aggregate view: components sum to deviceCount × perDevice.
-  const weightsGb = weights * (1 - r + deviceCount * r)
-  const activationsGb = activationsPerDevice * deviceCount
-  const overheadGb = framework.baselineOverheadGb * deviceCount
+  // Aggregate view: components sum to shards × perDevice.
+  const weightsGb = weights * (1 - r + shards * r)
+  const activationsGb = activationsPerDevice * shards
+  const overheadGb = framework.baselineOverheadGb * shards
   const totalGb = weightsGb + kv + activationsGb + overheadGb
 
   const usablePerDeviceGb = hardware.memoryGb * (hardware.unified ? (hardware.usableFraction ?? 1) : 1)
-  const usableGb = usablePerDeviceGb * deviceCount
+  const usableGb = usablePerDeviceGb * shards
   const utilization = perDeviceGb / usablePerDeviceGb
   const verdict = verdictFromUtilization(utilization)
 
@@ -272,10 +274,10 @@ export function estimateVram(config: CalcConfig): MemoryBreakdown {
         `Unified memory: ${Math.round((hardware.usableFraction ?? 1) * 100)}% of ${hardware.memoryGb} GB assumed allocatable for the GPU.`,
     })
   }
-  if (deviceCount > 1) {
+  if (shards > 1) {
     assumptions.push({
       id: 'multi-device',
-      text: `Multi-device sharding modeled simply: weights/KV split evenly across ${deviceCount} devices with ~${Math.round(REPLICATED_WEIGHT_FRACTION * 100)}% replicated weights and per-device runtime overhead. Real tensor-parallel overhead varies.`,
+      text: `Sharded across ${shards} GPUs (tensor-parallel): weights/KV split evenly with ~${Math.round(REPLICATED_WEIGHT_FRACTION * 100)}% replicated weights and per-GPU runtime overhead; the verdict is judged per GPU. Real TP overhead varies.`,
     })
   }
   if ((hardware.numChips ?? 1) > 1) {

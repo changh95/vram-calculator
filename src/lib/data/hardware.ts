@@ -44,8 +44,8 @@ export const HARDWARE: HardwareSpec[] = [
   { id: 'h100', vendor: 'NVIDIA', name: 'H100 SXM', memoryGb: 80, memoryType: 'HBM3', bandwidthGbs: 3350, unified: false, sources: [NV + 'data-center/h100/'] },
   { id: 'h100-nvl', vendor: 'NVIDIA', name: 'H100 NVL (per card)', memoryGb: 94, memoryType: 'HBM3', bandwidthGbs: 3900, unified: false, sources: [NV + 'data-center/h100/'] },
   { id: 'h200', vendor: 'NVIDIA', name: 'H200', memoryGb: 141, memoryType: 'HBM3e', bandwidthGbs: 4800, unified: false, sources: [NV + 'data-center/h200/'] },
-  { id: 'b200', vendor: 'NVIDIA', name: 'B200 (per GPU)', memoryGb: 180, memoryType: 'HBM3e', bandwidthGbs: 7700, unified: false, sources: [NV + 'data-center/dgx-b200/'] },
-  { id: 'b300', vendor: 'NVIDIA', name: 'B300 (per GPU)', memoryGb: 279, memoryType: 'HBM3e', bandwidthGbs: 8000, unified: false, sources: [NV + 'data-center/dgx-b300/'] },
+  { id: 'b200', vendor: 'NVIDIA', name: 'HGX B200 node (8× GPU)', memoryGb: 180, memoryType: 'HBM3e', bandwidthGbs: 7700, unified: false, gpusPerNode: 8, sources: [NV + 'data-center/dgx-b200/'] },
+  { id: 'b300', vendor: 'NVIDIA', name: 'HGX B300 node (8× GPU)', memoryGb: 279, memoryType: 'HBM3e', bandwidthGbs: 8000, unified: false, gpusPerNode: 8, sources: [NV + 'data-center/dgx-b300/'] },
   {
     id: 'dgx-spark',
     vendor: 'NVIDIA',

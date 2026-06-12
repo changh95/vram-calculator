@@ -154,6 +154,13 @@ export interface HardwareSpec {
   numChips?: number
   memoryPerChipGb?: number
   /**
+   * GPUs in the SKU when it's a multi-GPU server node (e.g. an 8-GPU HGX/DGX
+   * B200/B300). `memoryGb` stays the PER-GPU capacity; the estimator shards
+   * tensor-parallel across `gpusPerNode` and judges the verdict per GPU. The
+   * node total shown in the UI is memoryGb × gpusPerNode.
+   */
+  gpusPerNode?: number
+  /**
    * Usable DRAM per chip (GiB) for multi-chip mesh accelerators (Tenstorrent).
    * When set, the estimator shards weights/KV across `numChips` and judges the
    * verdict PER CHIP — not against the flat aggregate. Full marketed per-chip

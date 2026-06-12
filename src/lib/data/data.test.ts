@@ -221,6 +221,27 @@ describe('HARDWARE table', () => {
     }
   })
 
+  it('models B200/B300 as 8-GPU nodes (per-GPU memory × 8 = node total)', () => {
+    for (const id of ['b200', 'b300']) {
+      const h = HARDWARE.find((x) => x.id === id)!
+      expect(h.gpusPerNode, id).toBe(8)
+    }
+    // A 671B model at FP8 shards across the 8 GPUs of a B200 node and fits.
+    const m = MODELS.find((x) => x.id === 'deepseek-v3')!
+    const node = HARDWARE.find((x) => x.id === 'b200')!
+    const r = estimateVram({
+      model: m,
+      hardware: node,
+      quant: QUANTS.find((q) => q.id === 'fp8')!,
+      framework: FRAMEWORKS.find((f) => f.id === 'vllm')!,
+      deviceCount: 1,
+      contextLength: 8192,
+      concurrentSequences: 1,
+    })
+    expect(r.usableGb).toBeCloseTo(180 * 8, 0) // node total = 1440 GB
+    expect(r.verdict).toBe('fits') // ~671 GB weights / 8 GPUs ≈ 84 GB/GPU < 180
+  })
+
   it('covers all four vendors', () => {
     const vendors = new Set(HARDWARE.map((h) => h.vendor))
     for (const v of ['NVIDIA', 'Apple', 'AMD', 'Tenstorrent']) expect(vendors, v).toContain(v)

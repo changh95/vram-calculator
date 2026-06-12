@@ -43,7 +43,11 @@ const HARDWARE_GROUPS: SelectGroup[] = groupBy(HARDWARE, (h) => h.vendor)
   .sort((a, b) => (a.label === 'Tenstorrent' ? 0 : 1) - (b.label === 'Tenstorrent' ? 0 : 1))
   .map((g) => ({
     label: g.label,
-    options: g.items.map((h) => ({ value: h.id, label: h.name, meta: `${h.memoryGb} GB` })),
+    options: g.items.map((h) => ({
+      value: h.id,
+      label: h.name,
+      meta: `${h.gpusPerNode ? h.memoryGb * h.gpusPerNode : h.memoryGb} GB`,
+    })),
   }))
 
 const QUANT_GROUP: SelectGroup[] = [
@@ -127,7 +131,8 @@ export default function App() {
     { id: 'ovh', label: 'Overhead', gb: result.overheadGb },
   ]
   const ttHw = config.hardware.usableGbPerChip !== undefined
-  const unitCount = (ttHw ? (config.hardware.numChips ?? 1) : 1) * config.deviceCount
+  const unitCount =
+    (ttHw ? (config.hardware.numChips ?? 1) : (config.hardware.gpusPerNode ?? 1)) * config.deviceCount
 
   const m = config.model
   const archLabel: Record<string, string> = {
