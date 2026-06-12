@@ -116,7 +116,7 @@ export default function App() {
       suggestFixes(config, {
         quants: config.hardware.usableGbPerChip !== undefined ? TT_QUANTS : QUANTS,
         hardware: HARDWARE,
-        maxDevices: 8,
+        maxDevices: 16,
       }),
     [config],
   )
@@ -220,7 +220,7 @@ export default function App() {
               <ContextSlider label={tr('contextLength')} presets={CONTEXT_PRESETS} value={sel.contextLength} onChange={(v) => set({ contextLength: v })} />
               <div className="grid grid-cols-2 gap-x-6 gap-y-3 pt-1">
                 <Stepper label={tr('concurrentSeqs')} hint={tr('continuousBatch')} value={sel.concurrentSequences} min={1} max={64} onChange={(v) => set({ concurrentSequences: v })} />
-                <Stepper label={tr('devices')} hint={`× ${config.hardware.name.split(' ')[0]}`} value={sel.deviceCount} min={1} max={8} onChange={(v) => set({ deviceCount: v })} />
+                <Stepper label={tr('devices')} hint={`× ${config.hardware.name.split(' ')[0]}`} value={sel.deviceCount} min={1} max={16} onChange={(v) => set({ deviceCount: v })} />
               </div>
             </div>
           </section>

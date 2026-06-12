@@ -122,6 +122,16 @@ describe('App', () => {
     expect(screen.getByTestId('total-required').textContent).not.toBe(before)
   })
 
+  it('allows the device count up to 16 (raised from 8)', () => {
+    window.history.replaceState(null, '', '/?n=8')
+    const { unmount } = render(<App />)
+    expect(screen.getByRole('button', { name: /increase devices/i })).not.toBeDisabled() // 8 < 16
+    unmount()
+    window.history.replaceState(null, '', '/?n=16')
+    render(<App />)
+    expect(screen.getByRole('button', { name: /increase devices/i })).toBeDisabled() // at max 16
+  })
+
   it('switches UI language via the top-right dropdown', async () => {
     render(<App />)
     expect(screen.getByText('Configuration')).toBeInTheDocument()
