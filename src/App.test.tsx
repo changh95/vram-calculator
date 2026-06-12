@@ -73,6 +73,7 @@ describe('App', () => {
     render(<App />)
     // 2× RTX 4090 (24 GB each): the badge must read per-device (24 GB), matching
     // the gauge/legend below it — not the 48 GB aggregate.
+    await userEvent.selectOptions(screen.getByLabelText(/Hardware/), 'rtx-4090')
     await userEvent.click(screen.getByRole('button', { name: /increase devices/i }))
     const verdict = screen.getByRole('status').closest('div')!.parentElement!
     expect(verdict).toHaveTextContent(/of 24\.0 GB usable/)
@@ -88,7 +89,8 @@ describe('App', () => {
 
   it('shows a Buy Now link to tenstorrent.com only for Tenstorrent hardware', async () => {
     render(<App />)
-    // default hardware is an NVIDIA card — no Buy Now
+    // a non-Tenstorrent card has no Buy Now
+    await userEvent.selectOptions(screen.getByLabelText(/Hardware/), 'rtx-4090')
     expect(screen.queryByRole('link', { name: /buy now/i })).not.toBeInTheDocument()
     await userEvent.selectOptions(screen.getByLabelText(/Hardware/), 'tt-n300')
     const buy = screen.getByRole('link', { name: /buy now/i })

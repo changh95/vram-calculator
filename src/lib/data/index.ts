@@ -6,14 +6,14 @@ export { FRAMEWORKS } from './frameworks'
 export { QUANTS } from './quants'
 
 /**
- * Opening state — never blank (design requirement). A 9B-class model at Q4 on a
- * 4090 with llama.cpp produces an immediate "fits" verdict.
+ * Opening state — never blank (design requirement). A 9B-class model on a
+ * Blackhole p150a via the Tenstorrent stack produces an immediate "fits" verdict.
  */
 export const DEFAULTS: ConfigSelection = {
   modelId: 'qwen3.5-9b',
-  hardwareId: 'rtx-4090',
+  hardwareId: 'tt-p150a',
   quantId: 'q4_k_m',
-  frameworkId: 'llamacpp',
+  frameworkId: 'tt-metal',
   deviceCount: 1,
   contextLength: 8192,
   concurrentSequences: 1,

@@ -159,7 +159,10 @@ function estimateTenstorrent(config: CalcConfig): MemoryBreakdown {
       id: 'tt-blockfloat',
       text: `Tenstorrent runs mixed block-float weights (BFP8 attention + BFP4 MLP ≈ ${bpp} B/param) regardless of the selected quantization.`,
     },
-    { id: 'kv-dtype', text: 'KV cache assumed BFP8 (bfloat8_b) — the Tenstorrent default.' },
+    {
+      id: 'kv-dtype',
+      text: 'KV cache assumed BFP8 (bfloat8_b ≈ 1.06 B/elem) — the default "performance" profile. The "accuracy" profile and precision-sensitive models (e.g. Qwen2.5-7B) run BF16 KV (~2× larger); KV is usually a small share of TT memory, but this matters at long context or for replicated MLA KV.',
+    },
     {
       id: 'tt-per-chip',
       text: `Sized per chip: ${shards} chip${shards > 1 ? 's' : ''} × ${usablePerDeviceGb} GB usable DRAM each. Weights shard across the mesh (~${(REPLICATED_WEIGHT_FRACTION_TT * 100).toFixed(1)}% replicated); the verdict is judged per chip.`,
@@ -251,7 +254,7 @@ export function estimateVram(config: CalcConfig): MemoryBreakdown {
     },
     {
       id: 'kv-dtype',
-      text: `KV cache assumed ${framework.kvDtypeLabel} (${framework.label} default).`,
+      text: `KV cache assumed ${framework.kvDtypeLabel} — the ${framework.label} default and the heaviest common dtype. KV quantization (FP8/INT8/Q8/Q4) is widely supported and can cut KV memory 2–4×, so a long-context config may fit with less than shown.`,
     },
   ]
   if (hardware.unified) {
