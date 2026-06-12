@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VRAM Calculator</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --border:#2a3240;
+    --text:#e6edf3; --muted:#8b949e; --accent:#7c6cff; --accent2:#5b8cff;
+    --green:#3fb950; --amber:#d29922; --red:#f85149;
+    --weights:#5b8cff; --kv:#bc8cff; --act:#3fb950; --over:#e3a008;
+    --radius:12px; --mono:'SFMono-Regular',ui-monospace,'JetBrains Mono',Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+    font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1180px;margin:0 auto;padding:24px}
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;flex-wrap:wrap;gap:12px}
+  h1{font-size:20px;font-weight:700;margin:0;letter-spacing:-.02em}
+  h1 .sub{color:var(--muted);font-weight:500;font-size:13px;display:block;margin-top:2px}
+  .pill{background:var(--panel);border:1px solid var(--border);color:var(--muted);
+    padding:7px 14px;border-radius:999px;font-size:12px;font-weight:600}
+
+  .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:20px}
+  @media(max-width:840px){.grid{grid-template-columns:1fr}}
+
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
+    margin:0 0 16px;font-weight:600}
+
+  label.field{display:block;margin-bottom:18px}
+  label.field .lab{font-weight:600;font-size:13px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:baseline}
+  label.field .lab .hint{color:var(--muted);font-weight:400;font-size:11px}
+  select{width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--border);
+    border-radius:8px;padding:10px 12px;font-size:13px;font-family:var(--sans);appearance:none;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M3 5l3 3 3-3' stroke='%238b949e' stroke-width='1.5' fill='none' stroke-linecap='round'/></svg>");
+    background-repeat:no-repeat;background-position:right 12px center;cursor:pointer}
+  select:focus{outline:none;border-color:var(--accent)}
+
+  .slider-val{font-family:var(--mono);color:var(--accent2);font-weight:600}
+  input[type=range]{-webkit-appearance:none;width:100%;height:4px;border-radius:4px;
+    background:var(--border);outline:none;margin:10px 0 4px}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
+    background:var(--accent);cursor:pointer;border:2px solid var(--bg);box-shadow:0 0 0 1px var(--accent)}
+  input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--accent);
+    cursor:pointer;border:2px solid var(--bg)}
+  .ticks{display:flex;justify-content:space-between;color:var(--muted);font-size:10px;font-family:var(--mono)}
+
+  /* Results */
+  .verdict{display:flex;align-items:center;gap:14px;margin-bottom:20px;padding:16px;border-radius:10px;
+    background:var(--panel2);border:1px solid var(--border)}
+  .verdict .badge{font-weight:700;font-size:13px;padding:6px 12px;border-radius:999px;white-space:nowrap}
+  .verdict .num{font-family:var(--mono);font-size:28px;font-weight:700;letter-spacing:-.02em}
+  .verdict .cap{color:var(--muted);font-size:12px}
+  .b-fit{background:rgba(63,185,80,.15);color:var(--green)}
+  .b-tight{background:rgba(210,153,34,.15);color:var(--amber)}
+  .b-no{background:rgba(248,81,73,.15);color:var(--red)}
+
+  /* Bar chart: required vs capacity */
+  .chart{margin:6px 0 22px}
+  .barrow{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+  .barrow .name{width:80px;font-size:12px;color:var(--muted);text-align:right;flex-shrink:0}
+  .bartrack{flex:1;height:30px;background:var(--panel2);border-radius:6px;position:relative;overflow:hidden;border:1px solid var(--border)}
+  .barfill{height:100%;display:flex;align-items:center;border-radius:5px 0 0 5px;transition:width .35s cubic-bezier(.4,0,.2,1)}
+  .barrow .val{width:64px;font-family:var(--mono);font-size:12px;font-weight:600;flex-shrink:0}
+  .caplabel{position:absolute;right:8px;top:50%;transform:translateY(-50%);font-family:var(--mono);
+    font-size:11px;color:var(--muted)}
+
+  /* stacked allocation */
+  .stacked{height:26px;border-radius:6px;overflow:hidden;display:flex;margin:4px 0 14px;border:1px solid var(--border)}
+  .stacked span{height:100%;transition:width .35s cubic-bezier(.4,0,.2,1)}
+  .legend{display:grid;grid-template-columns:1fr 1fr;gap:8px 18px}
+  .legend .li{display:flex;align-items:center;justify-content:space-between;font-size:12px;
+    border-bottom:1px solid var(--border);padding-bottom:6px}
+  .legend .li .l{display:flex;align-items:center;gap:7px;color:var(--muted)}
+  .legend .dot{width:9px;height:9px;border-radius:3px;flex-shrink:0}
+  .legend .v{font-family:var(--mono);font-weight:600;color:var(--text)}
+  .legend .pct{color:var(--muted);font-weight:400;margin-left:6px;font-size:11px}
+
+  .note{margin-top:18px;font-size:11px;color:var(--muted);background:var(--panel2);
+    border:1px solid var(--border);border-radius:8px;padding:10px 12px;line-height:1.5}
+  .note b{color:var(--amber)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>VRAM Calculator <span class="sub">Can I run this model on my hardware?</span></h1>
+    <span class="pill">Inference · estimate</span>
+  </header>
+
+  <div class="grid">
+    <!-- CONFIG -->
+    <div class="card">
+      <h2>Configuration</h2>
+
+      <label class="field">
+        <span class="lab">Model</span>
+        <select id="model">
+          <optgroup label="Qwen3">
+            <option data-p="8" value="Qwen3-8B">Qwen3-8B · 8B</option>
+            <option data-p="32" value="Qwen3-32B" selected>Qwen3-32B · 32B</option>
+            <option data-p="235" value="Qwen3-235B">Qwen3-235B · 235B</option>
+          </optgroup>
+          <optgroup label="Gemma 4">
+            <option data-p="4" value="Gemma4-4B">Gemma4-4B · 4B</option>
+            <option data-p="27" value="Gemma4-27B">Gemma4-27B · 27B</option>
+          </optgroup>
+          <optgroup label="GLM-5"><option data-p="106" value="GLM-5">GLM-5 · 106B</option></optgroup>
+          <optgroup label="DeepSeek">
+            <option data-p="3" value="DeepSeek-R1-3B">DeepSeek-R1 · 3B</option>
+            <option data-p="671" value="DeepSeek-V3">DeepSeek-V3 · 671B</option>
+          </optgroup>
+          <optgroup label="Kimi"><option data-p="1000" value="Kimi-K2">Kimi-K2 · 1T</option></optgroup>
+          <optgroup label="Nemotron"><option data-p="70" value="Nemotron-70B">Nemotron · 70B</option></optgroup>
+        </select>
+      </label>
+
+      <label class="field">
+        <span class="lab">Hardware <span class="hint">VRAM capacity</span></span>
+        <select id="hw">
+          <optgroup label="NVIDIA">
+            <option data-c="11" value="2080ti">RTX 2080 Ti · 11 GB</option>
+            <option data-c="24" value="3090">RTX 3090 · 24 GB</option>
+            <option data-c="24" value="4090" selected>RTX 4090 · 24 GB</option>
+            <option data-c="32" value="5090">RTX 5090 · 32 GB</option>
+            <option data-c="48" value="a6000">A6000 · 48 GB</option>
+            <option data-c="96" value="rtxpro6000">RTX Pro 6000 · 96 GB</option>
+            <option data-c="48" value="l40s">L40S · 48 GB</option>
+            <option data-c="80" value="a100">A100 · 80 GB</option>
+            <option data-c="80" value="h100">H100 · 80 GB</option>
+            <option data-c="192" value="b200">B200 · 192 GB</option>
+            <option data-c="288" value="b300">B300 · 288 GB</option>
+            <option data-c="128" value="spark">DGX Spark · 128 GB (unified)</option>
+          </optgroup>
+          <optgroup label="Apple (unified)">
+            <option data-c="24" data-u="1" value="m4">M4 · 24 GB</option>
+            <option data-c="48" data-u="1" value="m4pro">M4 Pro · 48 GB</option>
+            <option data-c="128" data-u="1" value="m4max">M4 Max · 128 GB</option>
+            <option data-c="512" data-u="1" value="m5ultra">M5 Ultra · 512 GB</option>
+          </optgroup>
+          <optgroup label="AMD">
+            <option data-c="192" value="mi300x">MI300X · 192 GB</option>
+            <option data-c="288" value="mi350x">MI350X · 288 GB</option>
+          </optgroup>
+          <optgroup label="Tenstorrent">
+            <option data-c="12" value="n150">N150 · 12 GB</option>
+            <option data-c="24" value="n300">N300 · 24 GB</option>
+            <option data-c="96" value="t3k">T3K · 96 GB</option>
+          </optgroup>
+        </select>
+      </label>
+
+      <label class="field">
+        <span class="lab">Quantization <span class="hint">bytes / weight</span></span>
+        <select id="quant">
+          <option data-b="2" value="fp16">FP16 / BF16 · 2.0 B</option>
+          <option data-b="1" value="fp8">FP8 · 1.0 B</option>
+          <option data-b="1" value="int8">INT8 · 1.0 B</option>
+          <option data-b="0.5" value="int4" selected>INT4 / Q4 · 0.5 B</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span class="lab">Serving framework <span class="hint">KV strategy</span></span>
+        <select id="fw">
+          <option data-k="0.7" value="vllm" selected>vLLM · paged attn</option>
+          <option data-k="0.65" value="sglang">SGLang · radix cache</option>
+          <option data-k="1.0" value="llamacpp">llama.cpp</option>
+          <option data-k="1.0" value="ollama">Ollama</option>
+          <option data-k="0.6" value="trtllm">TensorRT-LLM</option>
+          <option data-k="0.85" value="mlx">MLX (Apple)</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span class="lab">Context length <span class="slider-val" id="ctxV">8K</span></span>
+        <input type="range" id="ctx" min="0" max="6" step="1" value="2">
+        <div class="ticks"><span>1K</span><span>4K</span><span>16K</span><span>64K</span><span>256K</span><span>1M</span></div>
+      </label>
+
+      <label class="field">
+        <span class="lab">Batch size <span class="slider-val" id="batV">1</span></span>
+        <input type="range" id="bat" min="1" max="64" step="1" value="1">
+        <div class="ticks"><span>1</span><span>16</span><span>32</span><span>48</span><span>64</span></div>
+      </label>
+
+      <label class="field" style="margin-bottom:0">
+        <span class="lab">Concurrent users <span class="slider-val" id="usrV">1</span></span>
+        <input type="range" id="usr" min="1" max="128" step="1" value="1">
+        <div class="ticks"><span>1</span><span>32</span><span>64</span><span>96</span><span>128</span></div>
+      </label>
+    </div>
+
+    <!-- RESULTS -->
+    <div class="card">
+      <h2>Memory Results</h2>
+
+      <div class="verdict">
+        <span class="badge" id="badge">—</span>
+        <div>
+          <div class="num" id="total">— GB</div>
+          <div class="cap" id="capline">of — GB VRAM</div>
+        </div>
+      </div>
+
+      <div class="chart">
+        <div class="barrow">
+          <span class="name">Required</span>
+          <div class="bartrack"><div class="barfill" id="reqBar"></div></div>
+          <span class="val" id="reqVal">—</span>
+        </div>
+        <div class="barrow">
+          <span class="name">Capacity</span>
+          <div class="bartrack"><div class="barfill" id="capBar" style="background:var(--border)"></div>
+            <span class="caplabel" id="capCap">—</span></div>
+          <span class="val" id="capValTxt">—</span>
+        </div>
+      </div>
+
+      <h2 style="margin-bottom:8px">Memory Allocation</h2>
+      <div class="stacked" id="stack"></div>
+      <div class="legend" id="legend"></div>
+
+      <div class="note" id="note"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const ctxVals = [1024, 4096, 16384, 65536, 262144, 1048576];
+const ctxLabels = ['1K','4K','16K','64K','256K','1M'];
+const fmt = g => g >= 100 ? g.toFixed(0) : g.toFixed(2);
+
+function compute(){
+  const m = $('model').selectedOptions[0];
+  const hw = $('hw').selectedOptions[0];
+  const q = $('quant').selectedOptions[0];
+  const fw = $('fw').selectedOptions[0];
+
+  const params = +m.dataset.p;           // billions
+  const cap = +hw.dataset.c;             // GB
+  const unified = hw.dataset.u === '1';
+  const bpw = +q.dataset.b;              // bytes/weight
+  const kvFactor = +fw.dataset.k;        // framework KV multiplier
+
+  const ctxIdx = +$('ctx').value;
+  const ctx = ctxVals[ctxIdx];
+  const batch = +$('bat').value;
+  const users = +$('usr').value;
+
+  $('ctxV').textContent = ctxLabels[ctxIdx];
+  $('batV').textContent = batch;
+  $('usrV').textContent = users;
+
+  // --- DUMMY estimate (placeholder formula — see open questions) ---
+  const weights = params * bpw;                                   // GB
+  const kvPerTok = params * 0.00002;                              // GB/token (toy)
+  const kv = kvPerTok * ctx * batch * users * kvFactor;
+  const activations = weights * 0.05 + batch * 0.02;
+  const overhead = weights * 0.08 + 0.8;                          // runtime/framework
+  const total = weights + kv + activations + overhead;
+
+  // unified memory: usable VRAM capped at ~75%
+  const usable = unified ? cap * 0.75 : cap;
+
+  const util = total / usable;
+  let state, txt;
+  if(util > 1){ state='b-no'; txt="WON'T FIT"; }
+  else if(util > 0.9){ state='b-tight'; txt='TIGHT'; }
+  else { state='b-fit'; txt='FITS'; }
+
+  // verdict
+  const badge = $('badge');
+  badge.className = 'badge ' + state;
+  badge.textContent = txt;
+  $('total').textContent = fmt(total) + ' GB';
+  $('capline').textContent = 'of ' + fmt(usable) + ' GB usable' + (unified?' (75% of '+cap+'GB unified)':'');
+
+  // bar chart (scale both to max of required/capacity)
+  const scaleMax = Math.max(total, usable) * 1.05;
+  const reqColor = state==='b-no'?'var(--red)':state==='b-tight'?'var(--amber)':'var(--green)';
+  $('reqBar').style.width = Math.min(100, total/scaleMax*100) + '%';
+  $('reqBar').style.background = reqColor;
+  $('reqVal').textContent = fmt(total)+' GB';
+  $('capBar').style.width = Math.min(100, usable/scaleMax*100) + '%';
+  $('capCap').textContent = '';
+  $('capValTxt').textContent = fmt(usable)+' GB';
+
+  // stacked allocation
+  const parts = [
+    ['Weights', weights, 'var(--weights)'],
+    ['KV cache', kv, 'var(--kv)'],
+    ['Activations', activations, 'var(--act)'],
+    ['Overhead', overhead, 'var(--over)']
+  ];
+  $('stack').innerHTML = parts.map(p =>
+    `<span style="width:${p[1]/total*100}%;background:${p[2]}"></span>`).join('');
+  $('legend').innerHTML = parts.map(p =>
+    `<div class="li"><span class="l"><span class="dot" style="background:${p[2]}"></span>${p[0]}</span>
+     <span class="v">${fmt(p[1])} GB<span class="pct">${(p[1]/total*100).toFixed(0)}%</span></span></div>`).join('');
+
+  // note
+  let n = `<b>Estimate only</b> — uses a placeholder formula. KV cache scales with context × batch × users (×${kvFactor} for ${fw.value}).`;
+  if(util > 1) n += ` Over by ${fmt(total-usable)} GB. Try INT4, shorter context, or larger hardware.`;
+  $('note').innerHTML = n;
+}
+
+document.querySelectorAll('select,input[type=range]').forEach(el =>
+  el.addEventListener('input', compute));
+compute();
+</script>
+</body>
+</html>

@@ -1,0 +1,1437 @@
+{
+  "summary": "Investigate tt-metal/tt-vllm source to derive an accurate Tenstorrent VRAM formula",
+  "agentCount": 13,
+  "logs": [
+    "Investigating Tenstorrent memory across 6 angles of the tt-metal/tt-vllm source",
+    "Completed 6/6 investigation+verify chains; synthesizing formula"
+  ],
+  "result": {
+    "findings": [
+      {
+        "key": "weight-precision",
+        "investigation": {
+          "area": "Weight precision profile -> effective bytes-per-weight on Tenstorrent device (tt-metal tt_transformers + tt-vllm plugin)",
+          "summary": "## Mechanism (verified from source)\n\n**Where the precision decision is made.** The tt-vllm plugin reads an optional `optimizations` string (\"performance\" | \"accuracy\") from the TT extra config and passes it straight through to the model class:\n\n- `plugins/vllm-tt-plugin/src/vllm_tt_plugin/src/.../loader.py` line 25: `optimizations = get_tt_config(vllm_config).get(\"optimizations\", None)` -> defaults to **None**, then passed to `model_class.initialize_vllm_model(..., optimizations=optimizations)`.\n\n**What None resolves to (the realistic serving default).** In `tt-metal/models/tt_transformers/tt/generator_vllm.py`, every mainstream text architecture (LlamaForCausalLM, QwenForCausalLM, MistralForCausalLM, Gemma3ForConditionalGeneration) declares `optimizations: str = \"performance\"` and resolves None to performance:\n```\noptimizations=DecodersPrecision.from_string(optimizations) if optimizations is not None else DecodersPrecision.performance\n```\nSo for a normal vLLM deployment the effective profile is **DecodersPrecision.performance**. (Note: the lower-level `ModelArgs.__init__` in `model_config.py` line 616-617 defaults a *None* optimizations to `DecodersPrecision.accuracy`, but the vLLM path never passes None to ModelArgs for these models — the generator substitutes performance first. The accuracy default only applies to non-vLLM/test callers.)\n\n**The precision tables.** `ModelOptimizations._default_settings()` is BFP8 for every weight tensor; `performance()` and `accuracy()` only *override* on top of that default.\n\nDEFAULT serving config = ModelOptimizations.performance applied to all decoders:\n- WQKV = **BFP8** (default, not overridden)\n- WO = **BFP8** (default, not overridden)\n- FF1_FF3 = **BFP4** (performance override -> `{TensorGroup.FF1_FF3: PrecisionSetting.BFP4}`)\n- FF2 = **BFP8** (default, not overridden)\n- KV_CACHE = BFP8; ACTIVATION = None (input dtype, usually BF16)\n\nPer-model exception in performance(): Qwen2.5-7B / Qwen2.5-VL-7B use BF16 for WQKV/WO/KV_CACHE and leave FFNs at the BFP8 default (no BFP4). Phi-3-mini only changes fidelity, not precision.\n\nFor accuracy(): >=70B Llama (Llama-3.1-70B, Llama-3.2-90B, DeepSeek-R1-Distill-Llama-70B) still use FF1_FF3=BFP4 (rest BFP8). Llama-3 / Mistral-7B / Phi families keep WQKV/WO/KV_CACHE=BFP8. Other (non-listed) models force WQKV/WO/KV_CACHE=BF16. FFN FF2 and (for the BFP8 families) FF1_FF3 remain BFP8 under accuracy.\n\n**Byte-cost mapping (verified).** `DecodersPrecision.get_tensor_dtype` maps PrecisionSetting -> ttnn dtype: BFP4->`ttnn.bfloat4_b`, BFP8->`ttnn.bfloat8_b`, BF16->`ttnn.bfloat16`, None->None. Block-float byte cost (16-elem tile blocks): BFP4 = 9/16 = **0.5625 B/elem**, BFP8 = 17/16 = **1.0625 B/elem**, BF16 = **2.0 B/elem**.\n\n**MoE / GPT-OSS caveat.** There is NO separate \"experts\" TensorGroup — the enum is exactly {FF1_FF3, FF2, WQKV, WO, KV_CACHE, ACTIVATION}. For standard MoE expressed through tt_transformers, expert MLPs reuse FF1_FF3/FF2 precision. GPT-OSS is a special case: `GptOssForCausalLM.initialize_vllm_model` asserts `optimizations is None` and `gpt_oss/tt/model_config.py` line 50-52 ignores optimizations entirely (`self.optimizations = None`); GPT-OSS ships its experts in MXFP4 natively (~0.5-0.55 B/elem, similar to BFP4) with attention in bf16/bfp8. Treat GPT-OSS experts as ~BFP4-equivalent, not via the DecodersPrecision tables.\n\n## Effective bytes-per-weight formula\n\nLet f_attn = fraction of (non-embedding, in-decoder) weight params in attention projections (WQKV+WO), f_ffn = 1 - f_attn = fraction in FFN/MLP (FF1+FF3+FF2). Split f_ffn into the FF1_FF3 vs FF2 sub-shares. For standard SwiGLU dense FFN, FF1+FF3 together = 2/3 of MLP params and FF2 = 1/3 (gate, up, down each = d_model*d_ff). For non-gated (single up/down) it is 1/2 and 1/2.\n\neffective_bpw = f_attn*( s_qkv*bpw(WQKV) + s_wo*bpw(WO) ) + f_ffn*( s_13*bpw(FF1_FF3) + s_2*bpw(FF2) )\n\nwith default-performance substitutions bpw(BFP8)=1.0625, bpw(BFP4)=0.5625, bpw(BF16)=2.0, and sub-shares s_13≈2/3, s_2≈1/3 (SwiGLU). WQKV vs WO sub-shares: s_qkv = (q+k+v cols)/(q+k+v+o cols); for MHA without GQA ≈0.75 QKV / 0.25 WO, for GQA shrink the K,V part.\n\n## Split estimation rule\n- Dense model: compute directly from dims. attn params/layer = d_model*(d_q + 2*d_kv) + d_model*d_model (WQKV + WO), where d_q=n_heads*head_dim, d_kv=n_kv_heads*head_dim. ffn params/layer = 3*d_model*d_ff (SwiGLU) or 2*d_model*d_ff. f_attn = attn/(attn+ffn). Typical dense (Llama-3-8B: d_model=4096, d_ff=14336, GQA 8 kv heads) -> f_attn ~ 0.20-0.25, f_ffn ~ 0.75-0.80, so FFN dominates and the BFP4 FF1_FF3 override drives most of the savings.\n- MoE model: experts dominate overwhelmingly. ffn(expert) params/layer = n_experts * 3 * d_model * d_ff_expert (only n_active routed at runtime but ALL experts are resident in DRAM, so use n_experts for memory). f_ffn typically > 0.9; f_attn < 0.1. Effective bpw is essentially the expert-FFN precision (BFP4 for FF1_FF3, BFP8 for FF2, or MXFP4 for GPT-OSS). Attention precision barely moves the total.",
+          "formulas": [],
+          "codeEvidence": [
+            {
+              "file": "tt-metal/models/tt_transformers/tt/model_config.py",
+              "symbol": "ModelOptimizations.performance",
+              "snippet": "settings = {\"TensorPrecision\": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4}, \"OpFidelity\": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI}}  # Qwen2.5-7B/VL-7B instead set WQKV/WO/KV_CACHE=BF16",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/model_config.py",
+              "symbol": "ModelOptimizations._default_settings",
+              "snippet": "\"TensorPrecision\": {TensorGroup.FF1_FF3: PrecisionSetting.BFP8, TensorGroup.FF2: PrecisionSetting.BFP8, TensorGroup.WQKV: PrecisionSetting.BFP8, TensorGroup.WO: PrecisionSetting.BFP8, TensorGroup.KV_CACHE: PrecisionSetting.BFP8, TensorGroup.ACTIVATION: None}",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/model_config.py",
+              "symbol": "PrecisionSetting / TensorGroup",
+              "snippet": "class PrecisionSetting(Enum): BFP4=\"bfp4\"; BFP8=\"bfp8\"; BF16=\"bf16\"   class TensorGroup(Enum): FF1_FF3=\"ff1_3\"; FF2=\"ff2\"; WQKV=\"wqkv\"; WO=\"wo\"; KV_CACHE=\"kv_cache\"; ACTIVATION=\"activation\"",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/model_config.py",
+              "symbol": "DecodersPrecision.get_tensor_dtype",
+              "snippet": "precision_setting_lookup = {PrecisionSetting.BFP4: ttnn.bfloat4_b, PrecisionSetting.BFP8: ttnn.bfloat8_b, PrecisionSetting.BF16: ttnn.bfloat16, None: None}",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/generator_vllm.py",
+              "symbol": "LlamaForCausalLM.initialize_vllm_model",
+              "snippet": "optimizations: str = \"performance\", ... optimizations=DecodersPrecision.from_string(optimizations) if optimizations is not None else DecodersPrecision.performance",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/generator_vllm.py",
+              "symbol": "QwenForCausalLM/MistralForCausalLM/Gemma3 initialize_vllm_model",
+              "snippet": "optimizations: str = \"performance\"  (same DecodersPrecision.from_string(...) else DecodersPrecision.performance pattern for Qwen, Mistral, Gemma3)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py"
+            },
+            {
+              "file": "vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/loader.py",
+              "symbol": "TTModelLoader.load_model",
+              "snippet": "optimizations = get_tt_config(vllm_config).get(\"optimizations\", None) ... model = model_class.initialize_vllm_model(..., optimizations=optimizations)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/loader.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/model_config.py",
+              "symbol": "ModelArgs.__init__ (non-vLLM default)",
+              "snippet": "if self.optimizations is None: self.optimizations = DecodersPrecision.accuracy(num_decoders=self.n_layers, model_name=self.model_name)  # only reached when caller passes None; vLLM generators substitute performance first",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py"
+            },
+            {
+              "file": "tt-metal/models/demos/gpt_oss/tt/model_config.py",
+              "symbol": "GptOss ModelArgs.__init__",
+              "snippet": "if optimizations is not None: logger.warning(\"GPT-OSS doesn't support any performance optimizations - ignoring optimizations argument\"); self.optimizations = None",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/demos/gpt_oss/tt/model_config.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/generator_vllm.py",
+              "symbol": "GptOssForCausalLM.initialize_vllm_model",
+              "snippet": "optimizations: str = None ... assert optimizations is None, \"Custom optimizations are not supported for this model\"",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py"
+            }
+          ],
+          "confidence": "high",
+          "sources": [
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/common.py",
+            "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/loader.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/demos/gpt_oss/tt/model_config.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/demos/llama3_70b_galaxy/tt/generator_vllm.py"
+          ],
+          "openQuestions": [
+            "Exact WQKV/WO sub-share and FF1_FF3 vs FF2 split are computed from model dims (not stored as constants in source) - confirmed SwiGLU 3-matrix structure but the calculator must derive s_13/s_2/s_qkv per model.",
+            "GPT-OSS expert MXFP4 byte cost is not emitted by the DecodersPrecision tables (GPT-OSS bypasses them); ~0.5-0.55 B/elem is inferred from MXFP4 format, not read from a tt-metal constant.",
+            "DecodersPrecision supports per-decoder JSON overrides (performance_decoder_config.json / accuracy_decoder_config.json under model_params/<model>/); a few models ship these and could deviate from the uniform performance profile per layer. Not enumerated here.",
+            "Whether tt-inference-server sets optimizations=performance|accuracy explicitly in its launch config (vs leaving it None) was not checked; if None, the generator default (performance) applies for Llama/Qwen/Mistral/Gemma."
+          ]
+        },
+        "verification": {
+          "verdict": "minor-corrections",
+          "corrections": [
+            {
+              "claim": "vLLM generators resolve optimizations to 'DecodersPrecision.performance' and (per the prose) the byte-cost-relevant tables are ModelOptimizations.performance/_default_settings applied per decoder.",
+              "was": "Investigation snippet: 'optimizations=DecodersPrecision.from_string(optimizations) if optimizations is not None else DecodersPrecision.performance' and treats DecodersPrecision.performance / ModelOptimizations.performance somewhat interchangeably.",
+              "shouldBe": "Verbatim source: from_string returns the FACTORY classmethod (cls.performance / cls.accuracy) whose signature is 'performance(cls, num_decoders, model_name)' / 'accuracy(cls, num_decoders, model_name)' (lines 4335, 4329) - these are DecodersPrecision factories, NOT ModelOptimizations.performance(cls, model_name) (lines 184/115). The _precision_factory then builds a per-decoder dict by calling optimization_level(model_name) (ModelOptimizations.performance/accuracy) for each layer (line 4435), OR loads model_params/<model>/performance_decoder_config.json if present (lines 4420-4433). Net precision profile is unchanged (performance for vLLM Llama/Qwen/Mistral/Gemma), so byte costs are unaffected; only the described call chain is imprecise. Note also ModelArgs.__init__ line 610-611 'if callable(optimizations): self.optimizations = optimizations(self)' invokes the factory with a single positional arg, inconsistent with the (num_decoders, model_name) signature - the exact in-model wiring differs from the simple description but does not change the resulting profile.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py lines 4316-4437, 610-617, 113-223"
+            },
+            {
+              "claim": "Block-float byte costs BFP4=9/16=0.5625, BFP8=17/16=1.0625, BF16=2.0 B/elem.",
+              "was": "Presented in the byte-cost mapping section alongside verified source mappings.",
+              "shouldBe": "These numeric byte costs are NOT defined anywhere in tt-metal model_config.py (grep for 9/16, 17/16, 0.5625, 1.0625, bytes_per_elem, element_size returned nothing). They are correctly DERIVED from the standard tt-metal block-float tile format (16-element shared-exponent blocks: BFP8 = 16x1B mantissa + 1B shared exponent = 17/16; BFP4 = 16x0.5B + 1B = 9/16); the investigation already flags this as inferred, not a source constant. Verified low-confidence-as-source but mathematically standard. No correction to the values, only confirming they are format-derived.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py (get_tensor_dtype lines 4364-4369 maps to ttnn.bfloat4_b/bfloat8_b/bfloat16; no byte-size constants present)"
+            }
+          ],
+          "confirmed": [
+            "TensorGroup enum (verbatim): FF1_FF3='ff1_3', FF2='ff2', WQKV='wqkv', WO='wo', KV_CACHE='kv_cache', ACTIVATION='activation'",
+            "PrecisionSetting enum (verbatim): BFP4='bfp4', BFP8='bfp8', BF16='bf16'",
+            "ModelOptimizations._default_settings TensorPrecision: FF1_FF3=BFP8, FF2=BFP8, WQKV=BFP8, WO=BFP8, KV_CACHE=BFP8, ACTIVATION=None (verbatim)",
+            "ModelOptimizations.performance(cls, model_name) (line 184): default branch settings = {'TensorPrecision': {TensorGroup.FF1_FF3: PrecisionSetting.BFP4}, 'OpFidelity': {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI}}; Qwen2.5-7B/Qwen2.5-VL-7B branch overrides WQKV/KV_CACHE/WO to BF16 (leaves FFN at BFP8 default, no BFP4); Phi-3-mini only adds LI_QKV_PREFILL fidelity change, no precision change (all verbatim)",
+            "ModelOptimizations.accuracy(cls, model_name) (line 115): Llama-3.1-70B/Llama-3.2-90B/DeepSeek-R1-Distill-Llama-70B keep FF1_FF3=BFP4; Llama-3/Mistral-7B/Phi-3-mini/phi-4/Meta-Llama-3 set WQKV/KV_CACHE/WO=BFP8; else branch forces WQKV/KV_CACHE/WO=BF16 (verbatim)",
+            "DecodersPrecision.get_tensor_dtype precision_setting_lookup (lines 4364-4369): {PrecisionSetting.BFP4: ttnn.bfloat4_b, PrecisionSetting.BFP8: ttnn.bfloat8_b, PrecisionSetting.BF16: ttnn.bfloat16, None: None} (verbatim); note prefetcher=True forces ttnn.bfloat8_b fallback for non-ACTIVATION weight tensors lacking a config (lines 4381-4382, 4390-4391)",
+            "generator_vllm.py LlamaForCausalLM/QwenForCausalLM/MistralForCausalLM initialize_vllm_model default 'optimizations: str = \"performance\"'; resolution 'optimizations=DecodersPrecision.from_string(optimizations) if optimizations is not None else DecodersPrecision.performance' (verbatim)",
+            "generator_vllm.py Gemma3ForConditionalGeneration also defaults optimizations='performance' (and max_seq_len=131072)",
+            "generator_vllm.py GptOssForCausalLM default 'optimizations: str = None' with 'assert optimizations is None, \"Custom optimizations are not supported for this model\"' (verbatim)",
+            "loader.py: optimizations = get_tt_config(vllm_config).get(\"optimizations\", None) -> default None; passed through to model_class.initialize_vllm_model(..., optimizations=optimizations) (verbatim)",
+            "ModelArgs.__init__ lines 616-617: 'if self.optimizations is None: self.optimizations = DecodersPrecision.accuracy(num_decoders=self.n_layers, model_name=self.model_name)' (verbatim, exact line numbers match investigation)",
+            "gpt_oss/tt/model_config.py: 'if optimizations is not None: logger.warning(\"GPT-OSS doesn't support any performance optimizations - ignoring optimizations argument\"); self.optimizations = None' (verbatim)",
+            "Per-decoder JSON override mechanism confirmed: PERFORMANCE_DECODER_CONFIG_FILENAME='performance_decoder_config.json', ACCURACY_DECODER_CONFIG_FILENAME='accuracy_decoder_config.json' (lines 48-49); _precision_factory loads model_params/<model_name>/<file> if it exists (lines 4416-4433) - validates open question #3"
+          ],
+          "summary": "Re-fetched the same source files and confirmed every load-bearing weight-precision claim verbatim. The precision tables (_default_settings BFP8-everywhere, performance() overriding FF1_FF3->BFP4 with Qwen2.5-7B/VL-7B BF16-attention exception and Phi-3-mini fidelity-only change, accuracy() keeping FF1_FF3=BFP4 for 70B+ and BFP8 attention for Llama-3/Mistral/Phi families else BF16) all match model_config.py exactly. The get_tensor_dtype precision_setting_lookup (BFP4->bfloat4_b, BFP8->bfloat8_b, BF16->bfloat16, None->None) is verbatim at lines 4364-4369. generator_vllm.py defaults (performance for Llama/Qwen/Mistral/Gemma3; None+assert for GptOss) and loader.py (.get('optimizations', None)) and the ModelArgs None->accuracy default at lines 616-617 and the GPT-OSS warning all confirmed verbatim. Two minor corrections, neither affecting byte costs: (1) the resolved factory is DecodersPrecision.performance/accuracy (signature num_decoders, model_name; per-decoder factories that internally call ModelOptimizations.performance/accuracy(model_name) or load per-model JSON), not ModelOptimizations.performance directly, and ModelArgs line 610-611 calls a callable optimizations with a single (self) arg which is inconsistent with that 2-arg signature - the resulting profile is still 'performance' so byte costs hold; (2) the block-float byte costs 0.5625/1.0625/2.0 are NOT source constants (grep confirms absent) but are correctly derived from the 16-element shared-exponent block-float tile format - the investigation already flagged this as inferred. NOTE: the verifier's prioritized items (KV block-count formula, block_size, sharding, usable-DRAM-per-chip, trace_region_size, token-budget caps) are entirely OUT OF SCOPE for this weight-precision investigation - it makes no claims about them, so there is nothing here to correct on those; they must be verified against the KV-cache/runtime-memory investigations instead. Files of record: /Users/hchang/... none written; source is tenstorrent/tt-metal main models/tt_transformers/tt/model_config.py and generator_vllm.py, tenstorrent/vllm dev plugins/vllm-tt-plugin/.../loader.py, and tt-metal models/demos/gpt_oss/tt/model_config.py."
+        }
+      },
+      {
+        "key": "kv-allocation",
+        "investigation": {
+          "area": "KV Cache Allocation on device (tt-metal tt_transformers + tt-vllm plugin)",
+          "summary": "## Mechanism\n\nThe TT vLLM plugin does NOT profile device memory. Instead it computes a fixed number of KV blocks from a **fixed token budget** (`max_tokens_all_users`) and forces it via `cache_config.num_gpu_blocks_override`. KV cache is sized to this fixed budget, NOT to the requested context length.\n\n### 1. Token budget (`get_max_tokens_all_users`)\nBase implementation (`models/common/model_capabilities.py`, `ModelCapabilitiesMixin`):\n```python\n@classmethod\ndef get_max_tokens_all_users(cls, **kwargs) -> int:\n    return FALLBACK_MAX_TOKENS_ALL_USERS   # = 131_072\n```\nPer-(model, device) overrides in `tt-metal/models/tt_transformers/tt/generator_vllm.py` key off `devices_per_dp_cache = num_devices // tt_data_parallel` and `is_wormhole_b0()`:\n- Llama-3.1-8B, 1 dev (N150), WH → **32_768**\n- Qwen3-8B, 1 dev (N150), WH → **32_768**\n- DeepSeek-R1-Distill-Qwen-14B / Qwen2.5-14B, 2 dev (N300), WH → **65_536**\n- Mistral-7B, 1 dev (N150), WH → **65_536**\n- gemma-3-4b, 1 or 2 dev, WH → **65_536**\n- Llama-3.2-90B, 8 dev (T3K), WH → **65_536**\n- Everything else → **131_072** (the fallback). Note the override functions return the special value only when the model/device pattern matches, otherwise `super()` → 131_072.\n\nIf the model class lacks the method (`AttributeError`), worker.py also defaults `max_tokens_all_users = 131_072`.\n\n### 2. num_tt_blocks formula (`worker.py: get_num_available_blocks_tt`)\n```python\nmax_batch = scheduler_config.max_num_seqs\nmax_tokens_all_users += cache_config.block_size * max_batch   # per-user padding\n# (sliding-window term is GATED OFF: _HYBRID_KV_CACHE_GROUPS_ENABLED = False)\nnum_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)\n```\nThen `self.cache_config.num_gpu_blocks_override = num_tt_blocks` (in `determine_available_memory`, which returns `1 << 64`). The per-user padding adds one extra block per concurrent user because vLLM's worst-case allocator assumes every touched block needs a fresh block (code comment: \"E.g. batch 32, block 64 needs an extra 2048 tokens\").\n\n### 3. Per-layer KV tensor shape (`model_runner.py: _kv_cache_shape`)\n```python\nnum_devices = self.device_config.num_devices // data_parallel\nnum_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)  # TP shard\nreturn (num_blocks, num_kv_heads, spec.block_size, spec.head_size)\n```\nOrdering confirmed independently by `tt-metal/models/tt_transformers/tt/common.py: get_block_size` which reads `kv_cache[0][0].shape[2]` (block_size at index 2), and by the vLLM_integration tech report (\"(max_num_blocks, num_kv_heads, block_size, head_size)\").\n\nAllocation (`generator_vllm.py: allocate_vllm_kv_cache_per_layer`) creates **2 tensors (K and V) per layer**, each of this shape, in DRAM, replicated across the submesh (`ReplicateTensorToMesh`). Dtype defaults to **ttnn.bfloat8_b** when no optimization override is set (→ 1.0625 B/elem).\n\n### 4. block_size default\n`cache_config.block_size` is taken from vLLM's standard `CacheConfig` (set by engine args / `get_attn_backend_cls`); it is NOT hardcoded in platform.py or worker.py. The TT paged-attention path operates with **block_size = 64** (the value used in the code's worked example and the TT paged-attention requirement); treat 64 as the operative default but note it is supplied by engine args, not pinned by a plugin constant (LOW confidence on it being literally enforced to 64 in source).\n\n## Memory formula (per device, fixed budget)\nLet B = block_size (=64), S = max_num_seqs (vLLM `--max-num-seqs`), T = max_tokens_all_users (table above), L = num_layers, H_kv = total num_kv_heads, D = head_size, ND = num_devices/dp, dt = bytes/elem (bf8 = 1.0625, bf16 = 2).\n\nnum_blocks = ceil((T + B*S) / B)\nkv_heads_per_dev = H_kv / min(ND, H_kv)   (TP sharding across devices in a DP submesh)\nkv_bytes_per_device = num_blocks * kv_heads_per_dev * B * D * dt * L * 2  (×2 = K and V)\n\nTotal system KV = kv_bytes_per_device × (num_devices). Because tensors are REPLICATED per submesh, each device in a DP submesh holds the full per-submesh cache; the H_kv TP-sharding reduces heads per device.",
+          "formulas": [
+            {
+              "name": "max_tokens_all_users (token budget, fixed)",
+              "expression": "override-table(model_name, devices_per_dp_cache, is_wormhole) else 131072; where devices_per_dp_cache = num_devices // tt_data_parallel",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "FALLBACK_MAX_TOKENS_ALL_USERS",
+                  "value": "131072",
+                  "basis": "models/common/model_capabilities.py: FALLBACK_MAX_TOKENS_ALL_USERS = 131_072"
+                },
+                {
+                  "name": "Llama-3.1-8B / Qwen3-8B @ N150 (1 dev, WH)",
+                  "value": "32768",
+                  "basis": "generator_vllm.py LlamaForCausalLM/QwenForCausalLM overrides"
+                },
+                {
+                  "name": "DeepSeek-R1-Distill-Qwen-14B / Qwen2.5-14B @ N300 (2 dev, WH)",
+                  "value": "65536",
+                  "basis": "generator_vllm.py QwenForCausalLM override"
+                },
+                {
+                  "name": "Mistral-7B @ N150 (1 dev, WH)",
+                  "value": "65536",
+                  "basis": "generator_vllm.py MistralForCausalLM override"
+                },
+                {
+                  "name": "gemma-3-4b @ 1 or 2 dev WH",
+                  "value": "65536",
+                  "basis": "generator_vllm.py Gemma3ForConditionalGeneration override"
+                },
+                {
+                  "name": "Llama-3.2-90B @ T3K (8 dev, WH)",
+                  "value": "65536",
+                  "basis": "generator_vllm.py MllamaForConditionalGeneration override"
+                }
+              ]
+            },
+            {
+              "name": "num_tt_blocks",
+              "expression": "math.ceil((max_tokens_all_users + block_size * max_num_seqs) / block_size)",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "per-user padding term",
+                  "value": "block_size * max_num_seqs",
+                  "basis": "worker.py: max_tokens_all_users += cache_config.block_size * max_batch; max_batch = scheduler_config.max_num_seqs"
+                },
+                {
+                  "name": "sliding_window term",
+                  "value": "DISABLED",
+                  "basis": "worker.py guards it with _HYBRID_KV_CACHE_GROUPS_ENABLED = False; term would be sliding_window*max_batch*8 if enabled"
+                }
+              ]
+            },
+            {
+              "name": "num_gpu_blocks_override assignment",
+              "expression": "cache_config.num_gpu_blocks_override = num_tt_blocks",
+              "confidence": "from-source",
+              "constants": []
+            },
+            {
+              "name": "per-layer KV tensor shape (per K and per V)",
+              "expression": "(num_blocks, num_kv_heads, block_size, head_size); num_kv_heads = spec.num_kv_heads // min(num_devices_per_dp, spec.num_kv_heads)",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "tensors per layer",
+                  "value": "2",
+                  "basis": "allocate_vllm_kv_cache_per_layer loops kv in ['k','v'] -> K and V tensors"
+                },
+                {
+                  "name": "block_size dim index",
+                  "value": "2",
+                  "basis": "common.py get_block_size returns kv_cache[0][0].shape[2]"
+                }
+              ]
+            },
+            {
+              "name": "kv_bytes (per device)",
+              "expression": "num_blocks * (num_kv_heads // min(num_devices_per_dp, num_kv_heads)) * block_size * head_size * bytes_per_elem * num_layers * 2",
+              "confidence": "inferred",
+              "constants": [
+                {
+                  "name": "bytes_per_elem (bfloat8_b)",
+                  "value": "1.0625",
+                  "basis": "default kv_cache_dtype = ttnn.bfloat8_b when no optimization override; bf8_b = 1 byte mantissa + shared exponent => 1.0625 B/elem"
+                },
+                {
+                  "name": "x2 factor",
+                  "value": "2",
+                  "basis": "separate K and V tensors per layer"
+                }
+              ]
+            },
+            {
+              "name": "block_size default",
+              "expression": "cache_config.block_size (from vLLM engine args; operative value 64)",
+              "confidence": "uncertain",
+              "constants": [
+                {
+                  "name": "block_size",
+                  "value": "64",
+                  "basis": "code comment 'block 64 needs an extra 2048 tokens' (batch 32*64=2048); NOT hardcoded in platform.py/worker.py — supplied by vLLM CacheConfig/engine args"
+                }
+              ]
+            }
+          ],
+          "codeEvidence": [
+            {
+              "file": "tt-metal/models/common/model_capabilities.py",
+              "symbol": "ModelCapabilitiesMixin.get_max_tokens_all_users",
+              "snippet": "@classmethod\ndef get_max_tokens_all_users(cls, **kwargs) -> int:\n    return FALLBACK_MAX_TOKENS_ALL_USERS  # FALLBACK_MAX_TOKENS_ALL_USERS = 131_072",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/common/model_capabilities.py"
+            },
+            {
+              "file": "vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py",
+              "symbol": "get_num_available_blocks_tt",
+              "snippet": "max_batch = scheduler_config.max_num_seqs\nmax_tokens_all_users += cache_config.block_size * max_batch\n\nsliding_window = model_config.get_sliding_window()\nif _HYBRID_KV_CACHE_GROUPS_ENABLED and sliding_window is not None:\n    _MAX_SLIDING_GROUPS_HEURISTIC = 8\n    max_tokens_all_users += (sliding_window * max_batch * _MAX_SLIDING_GROUPS_HEURISTIC)\n\nnum_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)\nreturn num_tt_blocks",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py"
+            },
+            {
+              "file": "vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py",
+              "symbol": "get_num_available_blocks_tt (fallback + padding comment)",
+              "snippet": "except AttributeError:\n    max_tokens_all_users = 131_072\n...\n# allocate an extra block_size per user since vLLM uses a worst-case\n# heuristic ... E.g. batch 32, block 64 needs an extra 2048 tokens.",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py"
+            },
+            {
+              "file": "vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py",
+              "symbol": "determine_available_memory / initialize_cache",
+              "snippet": "def determine_available_memory(self) -> int:\n    num_tt_blocks = get_num_available_blocks_tt(self.vllm_config)\n    self.cache_config.num_gpu_blocks_override = num_tt_blocks\n    return 1 << 64",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py"
+            },
+            {
+              "file": "vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py",
+              "symbol": "module constant",
+              "snippet": "_HYBRID_KV_CACHE_GROUPS_ENABLED = False  # gates off the sliding_window padding term",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py"
+            },
+            {
+              "file": "vllm/plugins/vllm-tt-plugin/src/vllm_tt_plugin/model_runner.py",
+              "symbol": "_kv_cache_shape",
+              "snippet": "num_devices = self.device_config.num_devices // data_parallel\nnum_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)\nreturn (num_blocks, num_kv_heads, spec.block_size, spec.head_size)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/model_runner.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/generator_vllm.py",
+              "symbol": "allocate_vllm_kv_cache_per_layer",
+              "snippet": "kv_cache_dtype = ttnn.bfloat8_b if kv_cache_dtype is None else kv_cache_dtype\nkv_tt_i = [ttnn.as_tensor(cache_kv, device=submesh, mesh_mapper=ttnn.ReplicateTensorToMesh(submesh), layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG, dtype=kv_cache_dtype, ...) for kv in [\"k\", \"v\"]]",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/generator_vllm.py",
+              "symbol": "LlamaForCausalLM.get_max_tokens_all_users",
+              "snippet": "devices_per_dp_cache = num_devices // tt_data_parallel\nif \"Llama-3.1-8B\" in model_name and devices_per_dp_cache == 1 and is_wormhole:\n    return 32_768\nreturn super().get_max_tokens_all_users(...)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py"
+            },
+            {
+              "file": "tt-metal/models/tt_transformers/tt/common.py",
+              "symbol": "get_block_size",
+              "snippet": "def get_block_size(kv_cache):\n    return kv_cache[0][0].shape[2]   # confirms block_size at shape index 2",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/common.py"
+            },
+            {
+              "file": "tt-metal/tech_reports/LLMs/vLLM_integration.md",
+              "symbol": "kv_cache_shape doc",
+              "snippet": "kv_cache_shape argument has shape (max_num_blocks, num_kv_heads, block_size, head_size)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tech_reports/LLMs/vLLM_integration.md"
+            }
+          ],
+          "confidence": "high",
+          "sources": [
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py",
+            "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py",
+            "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/model_runner.py",
+            "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/common/model_capabilities.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/common.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tech_reports/LLMs/vLLM_integration.md"
+          ],
+          "openQuestions": [
+            "block_size default: the literal value 64 is NOT pinned by a constant in platform.py or worker.py — it comes from vLLM's CacheConfig.block_size (engine args / get_attn_backend_cls). The code comment uses 'block 64' as the worked example, and TT paged attention conventionally uses 64, but source does not enforce/assert it. Confirm the actual --block-size passed by tt-inference-server model_spec.",
+            "bfloat8_b byte/elem: 1.0625 B/elem assumes 32-element tile sharing one 4-byte exponent (32 mantissa bytes + 4 exponent bytes over... actually 1 byte/elem + 4B exp per 32-elem block => 1.0625). Confirm ttnn bfloat8_b packs exponent per 16 or 32 element block to finalize the exact B/elem.",
+            "Replication vs sharding: KV tensors use ReplicateTensorToMesh (full cache replicated per device in submesh) while num_kv_heads is divided by min(num_devices, num_kv_heads). Confirm whether per-device head count reduction actually reduces per-device DRAM, or if replication negates it for GQA models with few KV heads.",
+            "Whether any non-WH (Blackhole) device path changes the override token budgets — overrides are all guarded by is_wormhole_b0()."
+          ]
+        },
+        "verification": {
+          "verdict": "minor-corrections",
+          "corrections": [
+            {
+              "claim": "bfloat8_b byte/elem basis: '1 byte mantissa + shared exponent => 1.0625 B/elem' assuming a 32-element tile sharing one 4-byte exponent (32 mantissa bytes + 4 exponent bytes).",
+              "was": "Stated basis: 32-element block shares one 4-byte exponent (open question even floated '32 mantissa bytes + 4 exponent bytes over...').",
+              "shouldBe": "The 1.0625 B/elem VALUE is correct, but the BASIS is wrong. ttnn Bfp8_b shares ONE exponent BYTE across 16 consecutive elements (a tile-face row), with 1 mantissa byte per element. So bytes/elem = 1 + 1/16 = 1.0625 exactly. (Per ttnn docs: '16 consecutive numbers share a single exponent'; data_formats.md: 'one exponent byte is shared across 16 consecutive datums within a tile face row'.) A 32x32 tile = 1024 elems = 1024 mantissa bytes + 64 exponent bytes = 1088 bytes => 1088/1024 = 1.0625 B/elem. The arithmetic coincides with the (wrong) 32-elem/4-byte story, so the FORMULA stays valid; only the stated rationale needs fixing.",
+              "source": "https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html and tech_reports/data_formats/data_formats.md (WebSearch snippet: 'one exponent byte is shared across 16 consecutive datums within a tile face row')"
+            },
+            {
+              "claim": "block_size = 64 is the operative default, NOT pinned anywhere in plugin source.",
+              "was": "Confidence 'uncertain'; open question whether 64 is enforced; suggested get_attn_backend_cls / engine args supply it.",
+              "shouldBe": "Confirmed: platform.py does NOT contain get_attn_backend_cls at all, and does NOT set/assert/override block_size or contain the literal 64. The only worker.py reference to 64 is the comment 'E.g. batch 32, block 64 needs an extra 2048 tokens.' So block_size genuinely comes from vLLM CacheConfig/engine args (or tt-inference-server model_spec), and is NOT pinned by the plugin. The investigation's LOW/uncertain confidence on '64 is enforced in source' is CORRECT and should remain uncertain. (Could not locate the exact --block-size value in tt-inference-server model_spec from source this pass; treat 64 as operative-but-unconfirmed.)",
+              "source": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py (no get_attn_backend_cls, no block_size, no literal 64) and worker.py comment"
+            }
+          ],
+          "confirmed": [
+            "FALLBACK_MAX_TOKENS_ALL_USERS = 131_072 — verbatim line in models/common/model_capabilities.py; get_max_tokens_all_users returns FALLBACK_MAX_TOKENS_ALL_USERS.",
+            "worker.py get_num_available_blocks_tt: 'max_batch = scheduler_config.max_num_seqs' then 'max_tokens_all_users += cache_config.block_size * max_batch' then 'num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)' then 'return num_tt_blocks'. Verbatim confirmed.",
+            "worker.py module constant '_HYBRID_KV_CACHE_GROUPS_ENABLED = False' — confirmed verbatim; the sliding_window term is gated behind it (if _HYBRID_KV_CACHE_GROUPS_ENABLED and sliding_window is not None) with _MAX_SLIDING_GROUPS_HEURISTIC = 8, so it is DISABLED.",
+            "worker.py except AttributeError branch: 'max_tokens_all_users = 131_072' — verbatim confirmed.",
+            "worker.py determine_available_memory: 'num_tt_blocks = get_num_available_blocks_tt(self.vllm_config)' then 'self.cache_config.num_gpu_blocks_override = num_tt_blocks' then 'return 1 << 64'. Verbatim confirmed.",
+            "worker.py comment verbatim: 'allocate an extra block_size per user since vLLM uses a worst-case heuristic and assumes each touched block will require a new allocation. E.g. batch 32, block 64 needs an extra 2048 tokens.'",
+            "model_runner.py _kv_cache_shape: 'num_devices = self.device_config.num_devices // data_parallel'; 'num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads)'; 'return (num_blocks, num_kv_heads, spec.block_size, spec.head_size)'. Verbatim confirmed. Docstring confirms 'caches are replicated per submesh and each device carries num_kv_heads // tp heads internally.'",
+            "generator_vllm.py overrides verbatim: Llama-3.1-8B & devices_per_dp_cache==1 & is_wormhole -> 32_768; Qwen3-8B & ==1 & WH -> 32_768; (DeepSeek-R1-Distill-Qwen-14B OR Qwen2.5-14B) & ==2 & WH -> 65_536; Mistral-7B & ==1 & WH -> 65_536; gemma-3-4b (model_name.lower()) & in (1,2) & WH -> 65_536; Llama-3.2-90B & ==8 & WH -> 65_536. All use devices_per_dp_cache = num_devices // tt_data_parallel and is_wormhole = is_wormhole_b0(); else super().",
+            "generator_vllm.py allocation: 'kv_cache_dtype = ttnn.bfloat8_b if kv_cache_dtype is None else kv_cache_dtype'; tensors created in a list comprehension 'for kv in [\"k\", \"v\"]' (2 tensors/layer, K and V); mesh_mapper=ttnn.ReplicateTensorToMesh(submesh); layout=ttnn.TILE_LAYOUT; memory_config=ttnn.DRAM_MEMORY_CONFIG. Verbatim confirmed.",
+            "common.py get_block_size: 'def get_block_size(kv_cache): return kv_cache[0][0].shape[2]' — block_size lives at shape index 2. Verbatim confirmed.",
+            "vLLM_integration.md: 'The kv_cache_shape argument has shape (max_num_blocks, num_kv_heads, block_size, head_size).' Verbatim confirmed (matches model_runner.py ordering).",
+            "platform.py check_and_update_config sets enable_prefix_caching=False, enable_chunked_prefill=False, async_scheduling=False, scheduler_cls=TT_SCHEDULER_CLS; does NOT touch block_size."
+          ],
+          "summary": "Re-fetched all load-bearing source files and confirmed the KV-allocation model is verbatim-accurate. CONFIRMED EXACTLY: (1) Token budget — FALLBACK_MAX_TOKENS_ALL_USERS = 131_072; per-model overrides in generator_vllm.py all match (Llama-3.1-8B/Qwen3-8B@1dev WH=32_768; DeepSeek-R1-Distill-Qwen-14B|Qwen2.5-14B@2dev=65_536; Mistral-7B@1dev=65_536; gemma-3-4b@1or2dev=65_536; Llama-3.2-90B@8dev=65_536), all gated by is_wormhole_b0() and devices_per_dp_cache = num_devices // tt_data_parallel. (2) num_tt_blocks = math.ceil((max_tokens_all_users + block_size*max_num_seqs) / block_size); sliding-window term is DISABLED (_HYBRID_KV_CACHE_GROUPS_ENABLED = False). (3) determine_available_memory sets cache_config.num_gpu_blocks_override = num_tt_blocks and returns 1<<64. (4) Per-layer shape (num_blocks, num_kv_heads, block_size, head_size) with num_kv_heads = spec.num_kv_heads // min(num_devices, spec.num_kv_heads) and num_devices = device_config.num_devices // data_parallel; confirmed by common.py shape[2] and the tech report. (5) 2 tensors/layer (K,V), dtype defaults ttnn.bfloat8_b, ReplicateTensorToMesh, DRAM_MEMORY_CONFIG, TILE_LAYOUT.\\n\\nTWO MINOR CORRECTIONS (neither changes the formula's numeric result): (a) The 1.0625 B/elem for bfloat8_b is CORRECT but the investigation's stated BASIS (32-element block / 4-byte exponent) is wrong — ttnn Bfp8_b shares ONE EXPONENT BYTE across 16 elements (1 mantissa byte/elem + 1 exp byte/16 = 1.0625). A 32x32 tile = 1024 mantissa bytes + 64 exp bytes = 1088 B => 1.0625 B/elem; the arithmetic coincides, so the formula stays valid. (b) block_size=64 is NOT pinned in source: platform.py has no get_attn_backend_cls, no block_size assignment, and no literal 64 — it comes from vLLM CacheConfig/engine args. The investigation's 'uncertain' confidence on this is correct and should stand. One residual gap: the actual --block-size from tt-inference-server model_spec was not located from source this pass (still treat 64 as operative-but-unconfirmed).\\n\\nSHARDING vs REPLICATION nuance is correctly captured: KV tensors are REPLICATED per submesh (ReplicateTensorToMesh), but the per-device head count is reduced via num_kv_heads // min(num_devices, num_kv_heads). model_runner docstring confirms 'caches are replicated per submesh and each device carries num_kv_heads // tp heads internally' — so per-device DRAM does scale down with TP head division, and each device in a DP submesh holds the full per-submesh cache. For GQA models where num_kv_heads < num_devices, the divisor is capped at num_kv_heads (min(...)), so heads-per-device floors at 1 and extra devices do not reduce it further.\",\"corrections_note\":\"see corrections array\"}"
+        }
+      },
+      {
+        "key": "sharding",
+        "investigation": {
+          "area": "Cross-chip sharding: per-chip DRAM memory model for tt-metal/tt_transformers mesh device distribution (T3K=8, QuietBox=8, Galaxy=32)",
+          "summary": "## Mechanism: how weights + KV map onto per-chip DRAM\n\ntt-vllm forces `tensor_parallel_size == 1` (platform.py assertion); all multi-chip distribution is done INSIDE tt-metal by opening a **mesh device** and using `ttnn` mesh-mappers when each tensor is created. The mesh is described by `cluster_shape = list(mesh_device.shape) = [rows, cols]`. `num_devices = mesh_device.get_num_devices() = rows * cols`.\n\n**Chip-count / mesh-shape mapping** (authoritative, from vLLM worker `mesh_grid_dict`):\n`N150=(1,1)=1`, `N300=(1,2)=2`, `T3K=(1,8)=8`, `TG/Galaxy=(8,4)=32`, `P100=(1,1)=1`, `P150=(1,1)=1`, `P150x2=(1,2)=2`, `P300=(1,2)=2`, `P150x4=(1,4)=4`, `P150x8=(1,8)=8`, `P300x2=(1,4)=4`, `N150x4=(1,4)=4`. If `MESH_DEVICE` env unset: `mesh_grid=(1, ttnn.get_num_devices())`. So `cluster_shape[1]` (cols) is the primary tensor-parallel/shard dimension for non-Galaxy; for Galaxy (8x4) the model splits into `cluster_shape[0]=8` row-groups (data-parallel) by `cluster_shape[1]=4` (tensor-parallel).\n\n**What SHARDS (÷ shard factor) vs REPLICATES per chip:**\n\n| Component | Mapper | Per-chip effect |\n|---|---|---|\n| QKV weights | `ShardTensor2dMesh dims=(2,3)` non-TG / `(3,2)` TG | sharded → ÷ num_devices (non-Galaxy); ÷(rows·cols) split 2D on Galaxy |\n| WO (out proj) | `ShardTensorToMesh dim=2` (or 2D `(2,3)`) | sharded → ÷ num_devices |\n| MLP w1/w3 (gate/up) | `ShardTensor2dMesh dims=(-2,-1)` non-galaxy / `(-1,-2)` galaxy | sharded → ÷ num_devices |\n| MLP w2 (down) | `ShardTensor2dMesh dims=(-1,-2)` non-galaxy / `(-2,-1)` galaxy | sharded → ÷ num_devices |\n| lm_head | `ShardTensorToMesh dim=-1` (vocab) | sharded → ÷ cluster_shape[1] (cols) |\n| token embedding | `ShardTensor2dMesh dims=(None,3)` | sharded on hidden dim across cols → ÷ cluster_shape[1]; REPLICATED across rows |\n| RMSNorm (standard) | `ReplicateTensorToMesh` | **REPLICATED on every chip** |\n| RMSNorm (distributed/fused, large hidden) | `ShardTensor2dMesh dims=(None,2)` | sharded on dim 2 |\n| **KV cache** | `ReplicateTensorToMesh` BUT tensor pre-sliced by `n_local_kv_heads` | **effectively sharded by KV heads → ÷ num_devices_per_group** |\n\n**KV cache — the subtle part (most important for accuracy):** The mapper is `ReplicateTensorToMesh`, which would naively suggest full replication. BUT the host tensor handed to it is already pre-sliced: `cache_k/cache_v` shape uses `self.n_local_kv_heads = self.n_kv_heads // self.num_devices_per_group`. So each chip physically holds only its `n_local_kv_heads` slice. Net: per-chip KV scales as `1/num_devices_per_group`.\n- Non-Galaxy (`TG=False`): `num_devices_per_group = num_devices` → per-chip KV = total_KV / num_devices, and `batch_size_per_device_group = max_batch_size` (full batch on each chip's head-slice).\n- Galaxy (`TG=True`, num_devices==32): `num_devices_per_group = n_kv_heads`; `num_device_groups = num_devices // n_kv_heads = 32 // n_kv_heads`; KV is sharded by kv_head AND batch is split: `batch_size_per_device_group = max(max_batch_size // num_device_groups, 1)`. Per-chip KV = (full_KV bytes) / (n_kv_heads) for the head dim, times (1/num_device_groups) for batch.\n\n**Per-chip bytes formula (non-Galaxy, T3K/QuietBox/N300):**\n`per_chip_bytes ≈ (sharded_weights_bytes / num_devices) + replicated_weights_bytes + (total_kv_bytes / num_devices)`\nwhere `replicated_weights_bytes` = RMSNorm/LayerNorm weights (small) replicated on every chip; everything else (attention proj, MLP, lm_head, embedding) is sharded. A flat aggregate check (total/num_chips) is slightly optimistic because the replicated norm weights are duplicated on every chip, but norms are tiny (a few MB) so the error is small unless many layers. For Galaxy the embedding/norms also replicate across the 8 rows, and weights are split 2D so per-chip ≈ weights/(rows·cols) for the 2D-sharded tensors.",
+          "formulas": [],
+          "codeEvidence": [
+            {
+              "file": "models/tt_transformers/tt/attention.py",
+              "symbol": "Attention.__init__",
+              "snippet": "self.num_devices = configuration.num_devices\nself.TG = self.num_devices == 32\nself.num_device_groups = self.num_devices // self.n_kv_heads\nself.num_devices_per_group = self.n_kv_heads if self.TG else self.num_devices\nself.batch_size_per_device_group = (max(self.max_batch_size // self.num_device_groups, 1) if self.TG else self.max_batch_size)\nself.n_local_heads = self.n_heads // self.num_devices_per_group\nself.n_local_kv_heads = self.n_kv_heads // self.num_devices_per_group",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/attention.py"
+            },
+            {
+              "file": "models/tt_transformers/tt/attention.py",
+              "symbol": "cache_k/cache_v + layer_past",
+              "snippet": "cache_k = torch.zeros((self.batch_size_per_device_group, self.n_local_kv_heads, self.max_seq_len, self.head_dim))  # standard case\n# paged: (max_num_blocks, n_local_kv_heads, block_size, head_dim)\nself.layer_past = [ttnn.as_tensor(k_or_v, dtype=self.kv_cache_dtype, ..., memory_config=ttnn.DRAM_MEMORY_CONFIG, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device), ...) for k_or_v in [cache_k, cache_v]]",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/attention.py"
+            },
+            {
+              "file": "models/tt_transformers/tt/attention.py",
+              "symbol": "wqkv as_tensor",
+              "snippet": "self.wqkv = ttnn.as_tensor(qkv_cat, ..., mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, dims=(3, 2) if self.TG else (2, 3), mesh_shape=configuration.cluster_shape), ...)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/attention.py"
+            },
+            {
+              "file": "models/tt_transformers/tt/mlp.py",
+              "symbol": "w1/w2/w3 sharding",
+              "snippet": "# w1 (gate): dims = (-1,-2) if args.is_galaxy else (-2,-1)\n# w2 (down): dims = (-2,-1) if args.is_galaxy else (-1,-2)\n# w3 (up):   dims = (-1,-2) if args.is_galaxy else (-2,-1)\nmesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, dims=dims, mesh_shape=args.cluster_shape)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/mlp.py"
+            },
+            {
+              "file": "models/tt_transformers/tt/lm_head.py",
+              "symbol": "lm_head weight",
+              "snippet": "ttnn.as_tensor(combined_split, device=mesh_device, mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=-1), layout=ttnn.TILE_LAYOUT, ...)  # sharded on vocab dim across mesh",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/lm_head.py"
+            },
+            {
+              "file": "models/tt_transformers/tt/embedding.py",
+              "symbol": "embedding weight",
+              "snippet": "self.weights = ttnn.as_tensor(torch_weight, ..., mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device=mesh_device, dims=(None, 3), mesh_shape=args.cluster_shape), layout=ttnn.ROW_MAJOR_LAYOUT, ...)  # sharded on hidden dim across cols, replicated across rows",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/embedding.py"
+            },
+            {
+              "file": "models/common/rmsnorm.py",
+              "symbol": "RMSNorm weight mapper",
+              "snippet": "# standard (replicated): mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh_device else None\n# distributed (sharded): mesh_mapper=ttnn.ShardTensor2dMesh(device, dims=(None, 2), mesh_shape=list(device.shape)) if is_mesh_device else None",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/common/rmsnorm.py"
+            },
+            {
+              "file": "models/tt_transformers/tt/model_config.py",
+              "symbol": "cluster_shape / num_devices / is_galaxy",
+              "snippet": "self.num_devices = mesh_device.get_num_devices() if mesh_device else 0\nself.cluster_shape = list(mesh_device.shape) if mesh_device is not None else None\nself.is_galaxy = self.num_devices == 32\nself.n_local_heads = self.n_heads // self.cluster_shape[1]",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py"
+            },
+            {
+              "file": "plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py",
+              "symbol": "check_and_update_config",
+              "snippet": "assert (vllm_config.parallel_config.tensor_parallel_size == 1 and vllm_config.parallel_config.pipeline_parallel_size == 1), \"TT backend does not support distributed execution\"",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py"
+            },
+            {
+              "file": "plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py",
+              "symbol": "mesh_grid_dict",
+              "snippet": "mesh_grid_dict = {\"N150\": (1,1), \"P100\": (1,1), \"P150\": (1,1), \"P150x2\": (1,2), \"N300\": (1,2), \"P300\": (1,2), \"N150x4\": (1,4), \"P150x4\": (1,4), \"T3K\": (1,8), \"P150x8\": (1,8), \"P300x2\": (1,4), \"TG\": (8,4)}\nmesh_device = ttnn.open_mesh_device(ttnn.MeshShape(*mesh_grid), ...)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py"
+            },
+            {
+              "file": "plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py",
+              "symbol": "get_num_available_blocks_tt",
+              "snippet": "max_tokens_all_users += cache_config.block_size * max_batch\nnum_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size)\n# default max_tokens_all_users = 131_072",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py"
+            }
+          ],
+          "confidence": "high",
+          "sources": [
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/attention.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/mlp.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/lm_head.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/embedding.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/common/rmsnorm.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py",
+            "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py",
+            "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py",
+            "https://github.com/tenstorrent/tt-metal/blob/main/tech_reports/Programming_Mesh_of_Devices/Programming_Mesh_of_Devices_with_TT-NN.md"
+          ],
+          "openQuestions": [
+            "determine_device_name() body was not retrievable verbatim (it is imported into model_config.py but defined elsewhere — likely models/tt_transformers/tt/common.py or a utils module under a different name); chip-count mapping confirmed instead via vLLM worker mesh_grid_dict which is authoritative.",
+            "Exact wo (output proj) mapper for the non-fused, non-TG path: reported as ShardTensorToMesh dim=2 for the simple case vs ShardTensor2dMesh dims=(2,3) for fused all-gather/TG — net per-chip effect is the same (÷num_devices) but worth confirming verbatim if exactness needed.",
+            "get_max_tokens_all_users() exact return expression per model class not retrieved; worker falls back to 131072 tokens when the model class does not implement it.",
+            "Whether wqkv combines all of Q,K,V into one tensor sharded by num_devices means Q is over-replicated when n_kv_heads < num_devices (GQA broadcast) — the head-padding/replication for GQA when num_devices > n_kv_heads on non-Galaxy could increase per-chip KV beyond the naive total/num_devices; not fully confirmed from source.",
+            "RMSNorm 'distributed' (dims=(None,2)) is used only for large-hidden fused norm; for most models norms are fully replicated (ReplicateTensorToMesh) on every chip — this is the only meaningful replicated-weight term that breaks a flat aggregate-capacity check, but it is small."
+          ]
+        },
+        "verification": {
+          "verdict": "minor-corrections",
+          "corrections": [
+            {
+              "claim": "platform.py codeEvidence entry: the tensor_parallel_size==1 assertion is attributed to file 'platform.py' but the url field points to worker.py",
+              "was": "codeEvidence file='plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py' but url='.../worker.py'",
+              "shouldBe": "The assertion text is verbatim-correct AND it does live in platform.py (TTPlatform.check_and_update_config). The url should be .../platform.py, not .../worker.py. Verbatim: assert (vllm_config.parallel_config.tensor_parallel_size == 1 and vllm_config.parallel_config.pipeline_parallel_size == 1), \"TT backend does not support distributed execution\"",
+              "source": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/platform.py"
+            },
+            {
+              "claim": "Block-float byte costs (bfp8_b=1.0625 B/elem, bfp4_b=0.5625 B/elem) are treated as established facts in the memory model",
+              "was": "Implied as a load-bearing constant for weight/KV byte sizing",
+              "shouldBe": "These exact bytes-per-element numbers are NOT stated verbatim anywhere in tt-metal source/docs I could re-fetch. What IS confirmed verbatim: 'the BFLOAT8_B format utilizes a block-floating point (BFP) representation, where 16 consecutive numbers share a single exponent'. The 1.0625/0.5625 values are DERIVED (16 mantissa bytes + 1 shared-exponent byte)/16 = 1.0625 for bfp8; (16*0.5 + 1)/16 = 0.5625 for bfp4; bf16 = 2 B/elem. Mark as derived / medium-confidence, not verbatim-sourced.",
+              "source": "https://docs.tenstorrent.com/tt-metal/latest/ttnn/ttnn/tensor.html"
+            },
+            {
+              "claim": "get_num_available_blocks_tt: 'default max_tokens_all_users = 131_072' and the simple padding line",
+              "was": "Only listed: max_tokens_all_users += cache_config.block_size * max_batch ; num_tt_blocks = math.ceil(...); default 131_072",
+              "shouldBe": "Confirmed verbatim, but the function ALSO has an additional sliding-window term not captured in the investigation: 'if _HYBRID_KV_CACHE_GROUPS_ENABLED and sliding_window is not None: max_tokens_all_users += (sliding_window * max_batch * _MAX_SLIDING_GROUPS_HEURISTIC)'. The 131_072 fallback is in an 'except AttributeError:' branch after calling model_class.get_max_tokens_all_users(...). For models with sliding window + hybrid KV groups enabled, the block count is higher than the simple formula.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/src/vllm_tt_plugin/worker.py"
+            }
+          ],
+          "confirmed": [
+            "attention.py device/head config VERBATIM: self.num_devices = configuration.num_devices ; self.TG = self.num_devices == 32 ; self.num_device_groups = self.num_devices // self.n_kv_heads ; self.num_devices_per_group = self.n_kv_heads if self.TG else self.num_devices ; self.batch_size_per_device_group = (max(self.max_batch_size // self.num_device_groups, 1) if self.TG else self.max_batch_size) ; self.n_local_heads = self.n_heads // self.num_devices_per_group ; self.n_local_kv_heads = self.n_kv_heads // self.num_devices_per_group",
+            "attention.py KV cache shapes VERBATIM. Paged: cache_k/cache_v = torch.zeros((self.paged_attention_config.max_num_blocks, self.n_local_kv_heads, self.paged_attention_config.block_size, self.head_dim)). Standard: torch.zeros((self.batch_size_per_device_group, self.n_local_kv_heads, self.max_seq_len, self.head_dim)). Confirms per-chip KV is pre-sliced by n_local_kv_heads.",
+            "attention.py layer_past mapper VERBATIM: ttnn.as_tensor(k_or_v, dtype=self.kv_cache_dtype, layout=self.args.get_attn_weights_layout(), device=self.mesh_device, memory_config=ttnn.DRAM_MEMORY_CONFIG, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device), ...). Confirms KV uses ReplicateTensorToMesh on an already-sliced host tensor.",
+            "attention.py wqkv mapper VERBATIM: ttnn.ShardTensor2dMesh(self.mesh_device, dims=(3, 2) if self.TG else (2, 3), mesh_shape=configuration.cluster_shape), memory_config=ttnn.DRAM_MEMORY_CONFIG if self.TG else wqkv_mem_config.",
+            "worker.py mesh_grid_dict VERBATIM: {'N150':(1,1),'P100':(1,1),'P150':(1,1),'P150x2':(1,2),'N300':(1,2),'P300':(1,2),'N150x4':(1,4),'P150x4':(1,4),'T3K':(1,8),'P150x8':(1,8),'P300x2':(1,4),'TG':(8,4)}. Note: investigation listed P300=(1,2) and P300x2=(1,4) and N150x4=(1,4) - all confirmed. T3K=(1,8)=8 chips, TG=(8,4)=32 chips confirmed.",
+            "worker.py KV block formula VERBATIM: max_tokens_all_users += cache_config.block_size * max_batch ; num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size) ; return num_tt_blocks. Fallback 131_072 confirmed (in except AttributeError branch).",
+            "worker.py trace_region_size VERBATIM: device_params['trace_region_size'] = 50000000 (50,000,000 = 50MB default), overridable via tt_config['trace_region_size'].",
+            "model_config.py VERBATIM: self.num_devices = mesh_device.get_num_devices() if mesh_device else 0 ; self.cluster_shape = list(mesh_device.shape) if mesh_device is not None else None ; self.is_galaxy = self.num_devices == 32 ; self.n_local_heads = self.n_heads // self.cluster_shape[1].",
+            "mlp.py sharding dims VERBATIM: w1_dims = (-1,-2) if args.is_galaxy else (-2,-1) ; w2_dims = (-2,-1) if args.is_galaxy else (-1,-2) ; w3 uses w1_dims = (-1,-2) if args.is_galaxy else (-2,-1). All via ttnn.ShardTensor2dMesh(self.mesh_device, dims=dims, mesh_shape=args.cluster_shape). All MLP weights are sharded (÷num_devices).",
+            "lm_head.py mapper VERBATIM: ttnn.as_tensor(combined_split, device=mesh_device, mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=-1), layout=ttnn.TILE_LAYOUT, ...). Sharded on vocab dim. Confirmed.",
+            "embedding.py mapper VERBATIM: ttnn.as_tensor(torch_weight, ..., mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device=mesh_device, dims=(None, 3), mesh_shape=args.cluster_shape), layout=ttnn.ROW_MAJOR_LAYOUT, ...). Sharded on hidden (dim 3) across cols, replicated across rows. Confirmed.",
+            "rmsnorm.py mappers VERBATIM: standard = ttnn.ReplicateTensorToMesh(device) if is_mesh_device else None (REPLICATED on every chip) ; distributed = ttnn.ShardTensor2dMesh(device, dims=(None, 2), mesh_shape=list(device.shape)) if is_mesh_device else None. Confirmed - norm is the one replicated weight term.",
+            "PagedAttentionConfig defaults VERBATIM (models/tt_transformers/tt/common.py): class PagedAttentionConfig: def __init__(self, block_size=32, max_num_blocks=1024). The default block_size is 32 and max_num_blocks is 1024. This is the tt-metal-side block_size; the vLLM-side cache_config.block_size is supplied by vLLM scheduler config.",
+            "BFLOAT8_B block structure confirmed verbatim (TT-NN tensor docs): '16 consecutive numbers share a single exponent, determined by the largest value in the group' - basis for derived 1.0625 B/elem cost.",
+            "Per-chip DRAM capacity: each Wormhole ASIC/chip has 12GB GDDR6 (n300 = 24GB GDDR6 across 2 ASICs = 12GB per chip; 6 DRAM controllers x 2GB). Usable-per-chip budget for weights+KV is less than 12GB after trace_region_size (50MB default) + L1/runtime overhead."
+          ],
+          "summary": "Re-fetched all load-bearing source files. The sharding model is verbatim-correct: every weight tensor (wqkv ShardTensor2dMesh dims=(3,2)/(2,3); MLP w1/w2/w3; lm_head ShardTensorToMesh dim=-1; embedding ShardTensor2dMesh dims=(None,3)) is sharded across the mesh, while RMSNorm uses ReplicateTensorToMesh (the one replicated weight term). KV cache is confirmed pre-sliced by n_local_kv_heads then ReplicateTensorToMesh, so per-chip KV = total/num_devices_per_group. The KV block formula (num_tt_blocks = math.ceil(max_tokens_all_users / cache_config.block_size), padding += block_size*max_batch, 131_072 fallback) and trace_region_size=50,000,000 are verbatim-correct. NEW FACTS: PagedAttentionConfig defaults are block_size=32, max_num_blocks=1024 (tt-metal side, in common.py); per-chip DRAM is 12GB GDDR6 per Wormhole ASIC. THREE minor corrections: (1) the platform.py assertion is correctly in platform.py but the investigation tagged it with a worker.py url; (2) the block-float byte costs bfp8=1.0625 / bfp4=0.5625 B/elem are DERIVED from the documented 16-elements-share-one-exponent structure, NOT verbatim-stated in any source - mark medium-confidence; (3) get_num_available_blocks_tt has an additional sliding-window/hybrid-KV term (sliding_window * max_batch * _MAX_SLIDING_GROUPS_HEURISTIC) that the investigation omitted, which raises block count for sliding-window models. None of these change the core per-chip formula but the byte-cost provenance and sliding-window term should be flagged. Overall the sharding investigation is accurate."
+        }
+      },
+      {
+        "key": "usable-dram",
+        "investigation": {
+          "area": "Usable DRAM per chip + runtime DRAM overhead (tt-metal allocator, DRAM bank reservations, trace region)",
+          "summary": "## Mechanism (from source)\n\nThe tt-metal allocator builds a per-DRAM-bank free space from the SoC-descriptor view size minus two reservations, computed in `L1BankingAllocator::generate_config` and `Allocator` init:\n\n```cpp\n// l1_banking_allocator.cpp (generate_config)\n.num_dram_channels   = soc_desc.get_num_dram_views(),\n.dram_bank_size      = soc_desc.dram_view_size,\n.dram_unreserved_base= hal.get_dev_addr(HalDramMemAddrType::UNRESERVED),\n.dram_alignment      = hal.get_alignment(HalMemType::DRAM),\n.trace_region_size   = align(trace_region_size, hal.get_alignment(HalMemType::DRAM)),\n\n// allocator.cpp\nDeviceAddr dram_bank_size = config_->dram_bank_size - config_->dram_unreserved_base - config_->trace_region_size;\ndram_manager_ = std::make_unique<BankManager>(BufferType::DRAM, bank_offsets, dram_bank_size,\n                  config_->dram_alignment, config_->dram_alignment, config_->dram_unreserved_base, ...);\n```\n\nSo per **DRAM bank (= DRAM \"view\")**: `usable = dram_view_size - dram_unreserved_base - trace_region_size`.\n\n### Bank counts and per-view size (SoC descriptors)\n- **Wormhole** `wormhole_b0_80_arch.yaml`: `dram_view_size: 1073741824` (1 GiB) with **12 views** (physical `dram_bank_size: 2147483648` = 2 GiB per controller, split into 2 views of 1 GiB). Total addressable = 12 GiB. Matches `MEM_DRAM_SIZE = (1048576*1024)` = 1 GiB in `wormhole/dev_mem_map.h`.\n- **Blackhole** `blackhole_140_arch.yaml`: `dram_view_size: 4278190080` (3.984 GiB) with **8 views**, `dram_bank_size: 4278190080`. Total = 31.867 GiB (\"32 GB\" nameplate). Matches `MEM_DRAM_SIZE = (4177920*1024U)` in `blackhole/dev_mem_map.h`.\n\n### dram_unreserved_base composition (wh_hal.cpp / bh_hal_dram.cpp, identical structure)\n`UNRESERVED = BARRIER + PROFILER + DEVICE_PRINT_DISPATCH + DRAM_BACKED_COMMAND_QUEUES`, all at the bottom of each bank:\n- `DRAM_BARRIER_SIZE = align(4, DRAM_ALIGNMENT)` -> WH 32 B, BH 64 B (host write/read fence per channel).\n- `DRAM_PROFILER` size = `get_dram_profiler_size(...)` = **0 unless `TRACY_ENABLE`** is compiled in (release/inference builds: 0). When enabled it is per-RISC profiler buffer × procs × ceil(96 cores/12 ch) aligned.\n- `DRAM_DEVICE_PRINT_DISPATCH_SIZE = DRAM_ALIGNMENT + (1<<20)` = ~1 MiB+align (WH 1,048,608 B; BH 1,048,640 B) — always present.\n- `DRAM_BACKED_COMMAND_QUEUES = enable_dram_backed_cq ? (1<<28 = 256 MiB) : 0`. Default **false** (`TT_METAL_DRAM_BACKED_CQ` env, \"Default: false (use hugepages)\" in rtoptions). So 0 in normal serving.\n\nRelease-build (TRACY off, dram_backed_cq false) `dram_unreserved_base` ≈ **1.0 MiB per bank**: WH = 32 + 0 + 1,048,608 + 0 = **1,048,640 B**; BH = 64 + 0 + 1,048,640 + 0 = **1,048,704 B**.\n\n### Usable DRAM (no trace)\n- WH per view = 1,073,741,824 − 1,048,640 = 1,072,693,184 B (0.99902 GiB); ×12 = **11.988 GiB** (~99.9% of 12 GiB).\n- BH per view = 4,278,190,080 − 1,048,704 = 4,277,141,376 B (3.9834 GiB); ×8 = **31.867 GiB** (~99.6% of 32 GiB).\n\n### Trace region DRAM cost\n`trace_region_size` (from `override_tt_config` in release_model_spec.json) is subtracted from **every** DRAM bank, so total trace DRAM = `align(trace_region_size, DRAM_ALIGNMENT) × num_views`. Default 0 (most models omit it). Observed override values: Qwen3-32B/T3K 54 MB (×12 = 0.60 GiB), Qwen3-32B/Galaxy tt_transformers 66,147,328 (0.74 GiB), Qwen3-32B/Galaxy qwen3_32b_galaxy 184,915,840 (2.07 GiB), gpt-oss-120b 134,217,728=128 MiB (1.5 GiB), Qwen3-8B N150 51 MB / N300 65 MB, P150X8 61,341,696, P300X2 402,653,184=384 MiB (4.5 GiB on WH-equiv). Typical serving trace ≈ 50–135 MB per bank.\n\n### FW / kernels / program binaries (NOT in DRAM)\nallocator.md: \"Reserved region in SRAM is used to hold FW, Kernels, and related runtime metadata.\" L1/SRAM per Tensix core: WH `MEM_L1_SIZE = 1464*1024` (1.43 MiB/core, ~108 MB aggregate), BH `MEM_L1_SIZE = 1536*1024` (1.5 MiB/core, ~180 MB aggregate). User Buffers allocate bottom-up in DRAM; **Program binaries allocate top-down in L1** (not DRAM). L1 scratch (`l1_small_size`, `worker_l1_size`) is an L1 partition and does **NOT** reduce the DRAM budget. The only firmware-side DRAM cost is the ~1 MiB device-print/barrier reserved base (above), plus the optional 256 MiB DRAM-backed CQ if explicitly enabled.\n\n## Per-chip overhead formula\n\n`per_chip_overhead_dram = num_views × (dram_unreserved_base + align(trace_region_size, DRAM_ALIGNMENT))`\n- num_views: WH=12, BH=8\n- dram_unreserved_base ≈ 1.0 MiB/bank (release); + 256 MiB/bank only if `TT_METAL_DRAM_BACKED_CQ=1`\n- trace_region_size: 0 by default; per-model override (50–402 MB) when set\n\n`usable_dram_per_chip = num_views × (dram_view_size − dram_unreserved_base − align(trace_region_size, DRAM_ALIGNMENT))`\n- WH: 11.988 GiB (trace=0) down to ~10–11.4 GiB with typical trace overrides\n- BH: 31.867 GiB (trace=0)",
+          "formulas": [
+            {
+              "name": "usable_dram_per_bank",
+              "expression": "dram_view_size - dram_unreserved_base - align(trace_region_size, dram_alignment)",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "dram_view_size_WH",
+                  "value": "1073741824 (1 GiB)",
+                  "basis": "wormhole_b0_80_arch.yaml dram_view_size; == MEM_DRAM_SIZE (1048576*1024)"
+                },
+                {
+                  "name": "dram_view_size_BH",
+                  "value": "4278190080 (3.984 GiB)",
+                  "basis": "blackhole_140_arch.yaml dram_view_size; == MEM_DRAM_SIZE (4177920*1024U)"
+                },
+                {
+                  "name": "dram_alignment_WH",
+                  "value": "32",
+                  "basis": "wormhole noc_parameters.h DRAM_ALIGNMENT = max(read=32,write=16)=32"
+                },
+                {
+                  "name": "dram_alignment_BH",
+                  "value": "64",
+                  "basis": "blackhole noc_parameters.h DRAM_ALIGNMENT = max(read=64,write=16)=64"
+                }
+              ]
+            },
+            {
+              "name": "dram_unreserved_base",
+              "expression": "DRAM_BARRIER_SIZE + dram_profiler_size + DRAM_DEVICE_PRINT_DISPATCH_SIZE + (enable_dram_backed_cq ? (1<<28) : 0)",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "DRAM_BARRIER_SIZE",
+                  "value": "align(4, DRAM_ALIGNMENT) => WH 32, BH 64",
+                  "basis": "wh_hal.cpp / bh_hal_dram.cpp: ((sizeof(uint32_t)+DRAM_ALIGNMENT-1)/DRAM_ALIGNMENT)*DRAM_ALIGNMENT"
+                },
+                {
+                  "name": "dram_profiler_size",
+                  "value": "0 unless TRACY_ENABLE",
+                  "basis": "wh_hal.cpp get_dram_profiler_size: #else return 0; release/inference builds have TRACY off"
+                },
+                {
+                  "name": "DRAM_DEVICE_PRINT_DISPATCH_SIZE",
+                  "value": "DRAM_ALIGNMENT + (1<<20) => WH 1048608, BH 1048640",
+                  "basis": "wh_hal.cpp/bh_hal_dram.cpp DRAM_DEVICE_PRINT_DISPATCH_PAYLOAD_SIZE = 1<<20 (1 MiB), always present"
+                },
+                {
+                  "name": "enable_dram_backed_cq",
+                  "value": "false (default)",
+                  "basis": "rtoptions: TT_METAL_DRAM_BACKED_CQ, 'Default: false (use hugepages)'; size = enable ? (1<<28=256MiB) : 0"
+                },
+                {
+                  "name": "dram_unreserved_base_WH_release",
+                  "value": "1048640 bytes (~1.0 MiB)",
+                  "basis": "32 + 0 + 1048608 + 0"
+                },
+                {
+                  "name": "dram_unreserved_base_BH_release",
+                  "value": "1048704 bytes (~1.0 MiB)",
+                  "basis": "64 + 0 + 1048640 + 0"
+                }
+              ]
+            },
+            {
+              "name": "usable_dram_per_chip",
+              "expression": "num_views * (dram_view_size - dram_unreserved_base - align(trace_region_size, dram_alignment))",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "num_views_WH",
+                  "value": "12",
+                  "basis": "wormhole_b0_80_arch.yaml: 12 dram views (6 controllers x 2 GiB split into 2x1 GiB views)"
+                },
+                {
+                  "name": "num_views_BH",
+                  "value": "8",
+                  "basis": "blackhole_140_arch.yaml: 8 dram views"
+                },
+                {
+                  "name": "usable_WH_trace0",
+                  "value": "11.988 GiB (12 x 1072693184 B)",
+                  "basis": "computed"
+                },
+                {
+                  "name": "usable_BH_trace0",
+                  "value": "31.867 GiB (8 x 4277141376 B)",
+                  "basis": "computed"
+                }
+              ]
+            },
+            {
+              "name": "per_chip_overhead_dram",
+              "expression": "num_views * (dram_unreserved_base + align(trace_region_size, dram_alignment))",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "base_overhead_WH",
+                  "value": "12 x 1.0 MiB = ~12.6 MiB (trace=0, cq off)",
+                  "basis": "12 banks x 1048640 B"
+                },
+                {
+                  "name": "base_overhead_BH",
+                  "value": "8 x 1.0 MiB = ~8.4 MiB (trace=0, cq off)",
+                  "basis": "8 banks x 1048704 B"
+                },
+                {
+                  "name": "trace_overhead_example_T3K_qwen3_32b",
+                  "value": "12 x 54,000,000 = 0.60 GiB",
+                  "basis": "release_model_spec.json Qwen3-32B T3K trace_region_size 54000000"
+                },
+                {
+                  "name": "trace_overhead_example_galaxy_qwen3_32b",
+                  "value": "12 x 184,915,840 = 2.07 GiB",
+                  "basis": "release_model_spec.json qwen3_32b_galaxy trace_region_size 184915840"
+                },
+                {
+                  "name": "dram_backed_cq_optional",
+                  "value": "+256 MiB per bank if TT_METAL_DRAM_BACKED_CQ=1",
+                  "basis": "1<<28 in get_dram_backed_command_queues_size"
+                }
+              ]
+            },
+            {
+              "name": "l1_sram_does_not_reduce_dram",
+              "expression": "FW + kernels + program_binaries + l1_small_size + worker_l1_size live entirely in on-chip L1/SRAM (WH MEM_L1_SIZE=1464*1024 per core ~108MB total; BH MEM_L1_SIZE=1536*1024 per core ~180MB total); subtract 0 from DRAM",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "MEM_L1_SIZE_WH",
+                  "value": "1464*1024 = 1499136 B (1.43 MiB/core)",
+                  "basis": "wormhole/dev_mem_map.h"
+                },
+                {
+                  "name": "MEM_L1_SIZE_BH",
+                  "value": "1536*1024 = 1572864 B (1.5 MiB/core)",
+                  "basis": "blackhole/dev_mem_map.h"
+                },
+                {
+                  "name": "fw_kernels_location",
+                  "value": "SRAM/L1 reserved region (NOT DRAM)",
+                  "basis": "allocator.md: 'Reserved region in SRAM is used to hold FW, Kernels, and related runtime metadata'; program binaries top-down in L1"
+                }
+              ]
+            }
+          ],
+          "codeEvidence": [
+            {
+              "file": "tt_metal/impl/allocator/allocator.cpp",
+              "symbol": "Allocator init (DRAM BankManager)",
+              "snippet": "DeviceAddr dram_bank_size = config_->dram_bank_size - config_->dram_unreserved_base - config_->trace_region_size;\ndram_manager_ = std::make_unique<BankManager>(BufferType::DRAM, bank_offsets, dram_bank_size, config_->dram_alignment, config_->dram_alignment, config_->dram_unreserved_base, config_->disable_interleaved);",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/impl/allocator/allocator.cpp"
+            },
+            {
+              "file": "tt_metal/impl/allocator/l1_banking_allocator.cpp",
+              "symbol": "generate_config",
+              "snippet": ".num_dram_channels = static_cast<size_t>(soc_desc.get_num_dram_views()),\n.dram_bank_size = soc_desc.dram_view_size,\n.dram_unreserved_base = static_cast<uint32_t>(hal.get_dev_addr(HalDramMemAddrType::UNRESERVED)),\n.dram_alignment = hal.get_alignment(HalMemType::DRAM),\n.trace_region_size = align(trace_region_size, hal.get_alignment(HalMemType::DRAM)),",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/impl/allocator/l1_banking_allocator.cpp"
+            },
+            {
+              "file": "tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal.cpp",
+              "symbol": "DRAM reserved region layout",
+              "snippet": "constexpr static std::uint32_t DRAM_BARRIER_BASE = 0;\nconstexpr static std::uint32_t DRAM_BARRIER_SIZE = ((sizeof(uint32_t) + DRAM_ALIGNMENT - 1) / DRAM_ALIGNMENT) * DRAM_ALIGNMENT;\nDRAM_PROFILER_BASE = DRAM_BARRIER_BASE + DRAM_BARRIER_SIZE;\nDRAM_DEVICE_PRINT_DISPATCH_PAYLOAD_SIZE = 1 << 20; // DRAM_DEVICE_PRINT_DISPATCH_SIZE = DRAM_ALIGNMENT + payload\nget_dram_backed_command_queues_size(bool e){ return e ? (1 << 28) : 0; }\nget_dram_unreserved_base = backed_cq_base + backed_cq_size; // size = MEM_DRAM_SIZE - unreserved_base",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal.cpp"
+            },
+            {
+              "file": "tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal_dram.cpp",
+              "symbol": "get_dram_unreserved_base / dram_*_ vectors",
+              "snippet": "get_dram_unreserved_base(profiler, cq) = backed_cq_base(profiler) + backed_cq_size(cq);\nget_dram_unreserved_size = MEM_DRAM_SIZE - get_dram_unreserved_base(...);\ndram_sizes_[UNRESERVED] = get_dram_unreserved_size(dram_profiler_size, enable_dram_backed_cq);",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal.cpp"
+            },
+            {
+              "file": "tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal.cpp",
+              "symbol": "get_dram_profiler_size",
+              "snippet": "constexpr std::uint32_t get_dram_profiler_size(...){\n#if defined(TRACY_ENABLE)\n ...\n#else\n return 0;\n#endif\n}",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal.cpp"
+            },
+            {
+              "file": "tt_metal/hw/inc/internal/tt-1xx/wormhole/dev_mem_map.h",
+              "symbol": "MEM_DRAM_SIZE / MEM_L1_SIZE (WH)",
+              "snippet": "#define MEM_DRAM_SIZE (1048576 * 1024)   // 1 GiB per view\n#define MEM_L1_SIZE (1464 * 1024)        // 1.43 MiB per Tensix core",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/hw/inc/internal/tt-1xx/wormhole/dev_mem_map.h"
+            },
+            {
+              "file": "tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h",
+              "symbol": "MEM_DRAM_SIZE / MEM_L1_SIZE (BH)",
+              "snippet": "#define MEM_DRAM_SIZE (4177920 * 1024U)  // 4,278,190,080 B = 3.984 GiB per view\n#define MEM_L1_SIZE (1536 * 1024)        // 1.5 MiB per Tensix core",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h"
+            },
+            {
+              "file": "tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml",
+              "symbol": "dram_view_size / dram_bank_size (WH)",
+              "snippet": "dram_view_size: 1073741824   # 1 GiB per view, 12 views\ndram_bank_size: 2147483648   # 2 GiB physical per controller (6 controllers)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml"
+            },
+            {
+              "file": "tt_metal/soc_descriptors/blackhole_140_arch.yaml",
+              "symbol": "dram_view_size / dram_bank_size (BH)",
+              "snippet": "dram_view_size: 4278190080   # 3.984 GiB per view, 8 views\ndram_bank_size: 4278190080",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/soc_descriptors/blackhole_140_arch.yaml"
+            },
+            {
+              "file": "tt_metal/llrt/rtoptions.cpp",
+              "symbol": "TT_METAL_DRAM_BACKED_CQ default",
+              "snippet": "bool dram_backed_cq = false;  // TT_METAL_DRAM_BACKED_CQ: Store command queues in device DRAM. Default: false (use hugepages)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/llrt/rtoptions.cpp"
+            },
+            {
+              "file": "tech_reports/memory/allocator.md",
+              "symbol": "FW/kernels in SRAM, binaries top-down",
+              "snippet": "\"Reserved region in SRAM is used to hold FW, Kernels, and related runtime metadata.\" ... user data Buffers allocated bottom-up in DRAM while Program binaries are allocated top-down (in L1). Wormhole 12 ~1GB DRAM banks; Blackhole 8 ~4GB DRAM banks; portion of each DRAM bank reserved for a barrier.",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tech_reports/memory/allocator.md"
+            },
+            {
+              "file": "release_model_spec.json",
+              "symbol": "trace_region_size override_tt_config values",
+              "snippet": "gpt-oss-120b T3K/GALAXY: 134217728 (128 MiB); Qwen3-8B N150: 51000000, N300: 65000000; Qwen3-32B T3K: 54000000, GALAXY(tt_transformers): 66147328, GALAXY(qwen3_32b_galaxy): 184915840 + worker_l1_size 1344544, P150X8: 61341696, P300X2: 402653184 (384 MiB); gemma-3-1b-it N150: l1_small_size 4096. Models without override_tt_config => trace_region_size 0.",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+            }
+          ],
+          "confidence": "high",
+          "sources": [
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/impl/allocator/allocator.cpp",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/impl/allocator/l1_banking_allocator.cpp",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/impl/allocator/allocator_types.hpp",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/llrt/hal/tt-1xx/wormhole/wh_hal.cpp",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal.cpp",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/llrt/hal.cpp",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/hw/inc/internal/tt-1xx/wormhole/dev_mem_map.h",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/hw/inc/internal/tt-1xx/blackhole/dev_mem_map.h",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/hw/inc/internal/tt-1xx/wormhole/noc/noc_parameters.h",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/hw/inc/internal/tt-1xx/blackhole/noc/noc_parameters.h",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/soc_descriptors/wormhole_b0_80_arch.yaml",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/soc_descriptors/blackhole_140_arch.yaml",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tt_metal/llrt/rtoptions.cpp",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/tech_reports/memory/allocator.md",
+            "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+          ],
+          "openQuestions": [
+            "DRAM_ALIGNMENT values (WH=32, BH=64) come from noc_parameters.h read/write alignment maxima as reported by WebFetch; the literal #define computing DRAM_ALIGNMENT was summarized not quoted line-for-line, but cross-checks with allocator.md (NoC read alignment) and the 32/64 barrier sizes.",
+            "get_dram_profiler_size uses profiler_dram_bank_size_per_risc_bytes passed from MetalContext; the exact non-zero value when TRACY is enabled was not retrieved (irrelevant for release/inference where it is 0).",
+            "trace_region_size is subtracted from EVERY DRAM bank in allocator.cpp, so total trace DRAM = aligned(trace_region_size) x num_views; confirmed by code but the per-bank-vs-total framing in tt-vllm/tt-transformers config docs was not separately verified.",
+            "The exact MetalContext/device call passing enable_dram_backed_cq into Hal() was not directly quoted; default-false is confirmed via rtoptions TT_METAL_DRAM_BACKED_CQ description."
+          ]
+        },
+        "verification": {
+          "verdict": "clean",
+          "corrections": [],
+          "confirmed": [
+            "WH soc descriptor (wormhole_b0_80_arch.yaml): dram_view_size: 1073741824, dram_bank_size: 2147483648, 12 dram_views (6 DRAM core controllers x 2 views). Re-fetched verbatim.",
+            "BH soc descriptor (blackhole_140_arch.yaml): dram_view_size: 4278190080, dram_bank_size: 4278190080, 8 dram_views (channels 0-7). Re-fetched verbatim.",
+            "allocator.cpp: 'DeviceAddr dram_bank_size = config_->dram_bank_size - config_->dram_unreserved_base - config_->trace_region_size;' and DRAM BankManager constructed with BufferType::DRAM, bank_offsets, dram_bank_size, dram_alignment(x2), dram_unreserved_base, disable_interleaved. Verbatim match.",
+            "l1_banking_allocator.cpp generate_config: .num_dram_channels = static_cast<size_t>(soc_desc.get_num_dram_views()), .dram_bank_size = soc_desc.dram_view_size, .dram_unreserved_base = static_cast<uint32_t>(hal.get_dev_addr(HalDramMemAddrType::UNRESERVED)), .dram_alignment = hal.get_alignment(HalMemType::DRAM), .trace_region_size = align(trace_region_size, hal.get_alignment(HalMemType::DRAM)). Verbatim match. NOTE: the allocator's 'dram_bank_size' is set to soc_desc.dram_view_size (1 GiB WH / 3.984 GiB BH per VIEW), NOT the physical 2 GiB controller bank — confirming usable budget is computed per-view.",
+            "WH dev_mem_map.h: #define MEM_L1_SIZE (1464 * 1024); #define MEM_DRAM_SIZE (1048576 * 1024) = 1073741824 = matches dram_view_size. Verbatim.",
+            "BH dev_mem_map.h: #define MEM_L1_SIZE (1536 * 1024); #define MEM_DRAM_SIZE (4177920 * 1024U) = 4278190080 = matches dram_view_size. Verbatim.",
+            "WH wh_hal.cpp DRAM reserved chain (verbatim): DRAM_BARRIER_BASE=0; DRAM_BARRIER_SIZE=((sizeof(uint32_t)+DRAM_ALIGNMENT-1)/DRAM_ALIGNMENT)*DRAM_ALIGNMENT; DRAM_PROFILER_BASE=DRAM_BARRIER_BASE+DRAM_BARRIER_SIZE; DRAM_DEVICE_PRINT_DISPATCH_PAYLOAD_SIZE=1<<20; DRAM_DEVICE_PRINT_DISPATCH_SIZE=DRAM_ALIGNMENT+DRAM_DEVICE_PRINT_DISPATCH_PAYLOAD_SIZE; get_dram_device_print_dispatch_base=DRAM_PROFILER_BASE+dram_profiler_size; get_dram_backed_command_queues_base=device_print_dispatch_base+DRAM_DEVICE_PRINT_DISPATCH_SIZE; get_dram_backed_command_queues_size = enable ? (1<<28) : 0; get_dram_unreserved_base = cq_base + cq_size.",
+            "WH get_dram_profiler_size: #if defined(TRACY_ENABLE) ... #else return 0; #endif — confirmed 0 in release/inference builds. Verbatim.",
+            "BH bh_hal.cpp DRAM reserved region constants confirmed verbatim and structurally identical to WH: DRAM_BARRIER_SIZE=align(4,DRAM_ALIGNMENT); DRAM_DEVICE_PRINT_DISPATCH_PAYLOAD_SIZE=1<<20; DRAM_DEVICE_PRINT_DISPATCH_SIZE=DRAM_ALIGNMENT+payload; get_dram_backed_command_queues_size=enable?(1<<28):0; get_dram_unreserved_base=cq_base+cq_size; get_dram_unreserved_size=MEM_DRAM_SIZE-get_dram_unreserved_base(...).",
+            "DRAM_ALIGNMENT WH=32: noc_parameters.h NOC_DRAM_READ_ALIGNMENT_BYTES 32, NOC_DRAM_WRITE_ALIGNMENT_BYTES 16, DRAM_ALIGNMENT=max(read,write)=32. Verbatim.",
+            "DRAM_ALIGNMENT BH=64: noc_parameters.h NOC_DRAM_READ_ALIGNMENT_BYTES 64, NOC_DRAM_WRITE_ALIGNMENT_BYTES 16, DRAM_ALIGNMENT=max=64. Verbatim.",
+            "Derived unreserved_base values confirmed: WH = 32 (barrier) + 0 (profiler) + (32+1048576=1048608 device-print) + 0 (cq) = 1,048,640 B. BH = 64 + 0 + (64+1048576=1048640) + 0 = 1,048,704 B. Both match the investigation.",
+            "rtoptions.cpp: dram_backed_cq default false; TT_METAL_DRAM_BACKED_CQ description 'Store command queues in device DRAM. Default: false (use hugepages)'. Verbatim — confirms CQ term = 0 in normal serving.",
+            "release_model_spec.json trace_region_size overrides confirmed verbatim: Qwen3-32B T3K=54000000, qwen3_32b_galaxy=184915840 (+worker_l1_size 1344544), gpt-oss-120b=134217728, Qwen3-8B N150=51000000, N300=65000000, P150X8=61341696, P300X2=402653184, gemma-3-1b-it l1_small_size=4096.",
+            "Usable DRAM per chip (trace=0): WH = 12 x (1073741824 - 1048640) = 12 x 1072693184 = 12,872,318,208 B (11.988 GiB). BH = 8 x (4278190080 - 1048704) = 8 x 4277141376 = 34,217,131,008 B (31.867 GiB). Arithmetic verified against confirmed constants."
+          ],
+          "summary": "I independently re-fetched all load-bearing source files (WH/BH soc descriptors, allocator.cpp, l1_banking_allocator.cpp, wh_hal.cpp, bh_hal.cpp, both dev_mem_map.h, both noc_parameters.h, rtoptions.cpp, release_model_spec.json) and confirmed every load-bearing formula and constant is VERBATIM-correct. VERDICT: clean — no corrections.\n\nKey confirmations:\n- usable_dram_per_bank = dram_view_size - dram_unreserved_base - align(trace_region_size, dram_alignment), exactly as in allocator.cpp ('DeviceAddr dram_bank_size = config_->dram_bank_size - config_->dram_unreserved_base - config_->trace_region_size;').\n- allocator's dram_bank_size = soc_desc.dram_view_size (per VIEW: 1 GiB WH / 3.984 GiB BH), NOT the 2 GiB physical controller bank on WH. Budget is per-view.\n- num_views: WH=12, BH=8 (verbatim from soc descriptors).\n- dram_view_size: WH=1073741824, BH=4278190080 (== MEM_DRAM_SIZE in each dev_mem_map.h).\n- dram_alignment: WH=32 (max(32,16)), BH=64 (max(64,16)) — verbatim from noc_parameters.h.\n- dram_unreserved_base = BARRIER + profiler(0 unless TRACY) + DEVICE_PRINT_DISPATCH(DRAM_ALIGNMENT+1<<20) + CQ(1<<28 if enabled, default false). Release values: WH=1,048,640 B; BH=1,048,704 B. BH structure verified verbatim in bh_hal.cpp (not bh_hal_dram.cpp, which is L1/DRISC).\n- trace_region_size is aligned then subtracted from EVERY DRAM bank; all release_model_spec.json override values match verbatim.\n- L1/SRAM (MEM_L1_SIZE WH=1464*1024, BH=1536*1024), FW/kernels, program binaries, l1_small_size, worker_l1_size do NOT reduce the DRAM budget — confirmed.\n\nThe single nuance worth flagging (already correctly stated in the investigation, not an error): on Wormhole the physical controller dram_bank_size is 2147483648 (2 GiB) but the allocator uses soc_desc.dram_view_size = 1073741824 (1 GiB) x 12 views. The calculator must use dram_view_size x num_views, never dram_bank_size x num_controllers.\n\nMinor source-location note (not a correction to any number): the BH DRAM reserved-region constants live in tt_metal/llrt/hal/tt-1xx/blackhole/bh_hal.cpp, not bh_hal_dram.cpp (the latter handles L1/DRISC memory). The investigation's primary BH source URL already pointed at bh_hal.cpp, so the evidence is sound."
+        }
+      },
+      {
+        "key": "token-budgets",
+        "investigation": {
+          "area": "Token Budgets & Supported Configs (release_model_spec.json + get_max_tokens_all_users)",
+          "summary": "## How KV memory is budgeted on Tenstorrent (Angle 5)\n\nThe KV cache on TT is sized to a **FIXED all-user token budget**, not to arbitrary per-user context. Two layers govern this:\n\n### 1. The serving caps (release_model_spec.json, tt-inference-server, release 0.15.0 / schema 0.1.0)\nTop-level shape: `{ \"schema_version\": \"0.1.0\", \"release_version\": \"0.15.0\", \"model_specs\": [...] }`. Each entry has `hf_model_repo`, `device_type`, `status`, `max_model_len`, `max_num_seqs`, `block_size`, `min_ram_gb`, and `vllm_args` (which carries `max_num_batched_tokens` and sometimes `data_parallel_size`). NOTE: most numeric fields are stored as **strings** (e.g. `\"40960\"`, `\"32\"`), with occasional ints (e.g. gpt-oss-120b GALAXY `max_num_seqs: 32`).\n\nKey observations for the calculator:\n- `block_size` is **64 for every entry** in this release (vLLM paged-attention page size, in tokens).\n- `max_num_batched_tokens` in `vllm_args` equals `max_model_len` in every entry observed → prefill is one full context.\n- `max_model_len` is the per-request context cap; `max_num_seqs` is max concurrency (batch).\n- **This release (0.15.0) contains NO Llama models.** The 8 distinct repos are: `openai/gpt-oss-20b`, `openai/gpt-oss-120b`, `arcee-ai/AFM-4.5B`, `google/gemma-3-1b-it`, `Qwen/Qwen3-8B`, `Qwen/Qwen3-32B`, `Qwen/QwQ-32B`, `mistralai/Mistral-7B-Instruct-v0.3`. Anything else (Llama-3.x, DeepSeek, gemma-3-4b/27b, Llama-90B) should be flagged as \"not in this release spec\" even though tt-metal code has overrides for them.\n\n### 2. The KV-budget rule (tt-metal `get_max_tokens_all_users`)\nThe vLLM plugin asks the model class for `get_max_tokens_all_users(model_name, num_devices, tt_data_parallel)`. This returns the **total token budget across ALL concurrent users** that the KV cache is allocated for — i.e. KV memory is sized for this many tokens total, then sliced into `block_size=64` pages and shared among up to `max_num_seqs` users. The base default (when no override matches) is `FALLBACK_MAX_TOKENS_ALL_USERS = 131_072` in `models/common/model_capabilities.py` (`ModelCapabilitiesMixin.get_max_tokens_all_users`). Subclasses in `generator_vllm.py` override it for small-device configs (see formulas). The override key is `devices_per_dp_cache = num_devices // tt_data_parallel` plus `is_wormhole_b0()`.\n\nSo: **KV bytes ≈ f(max_tokens_all_users)**, where `max_tokens_all_users` = the per-config override if one matches, else the model_spec's `max_model_len`/`max_num_batched_tokens`, else 131072. The calculator should cap usable context to `max_model_len` and total served tokens to `max_tokens_all_users`, and reject (model, device) pairs absent from the spec.\n\n### Device classes that exist (device_type enum in spec)\nWormhole: `N150` (1 WH chip), `N300` (2 WH), `T3K` (8 WH), `GALAXY` (32 WH / 6U), `GALAXY_T3K` (T3K-shaped slice of a Galaxy). Blackhole: `P300` (2 BH), `P150X8` (8 × P150 BH), `P300X2` (2 × P300 BH). `data_parallel_size: 4` appears on GALAXY entries (the 32 chips split into 4 DP replicas of 8).",
+          "formulas": [
+            {
+              "name": "max_tokens_all_users (KV budget) resolution order",
+              "expression": "max_tokens_all_users = override(model_name, devices_per_dp_cache, is_wormhole) IF a code override matches; ELSE spec.vllm_args.max_num_batched_tokens (== spec.max_model_len in all observed entries); ELSE FALLBACK_MAX_TOKENS_ALL_USERS = 131072",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "FALLBACK_MAX_TOKENS_ALL_USERS",
+                  "value": "131072",
+                  "basis": "models/common/model_capabilities.py: `FALLBACK_MAX_TOKENS_ALL_USERS = 131_072`, returned by ModelCapabilitiesMixin.get_max_tokens_all_users base method"
+                }
+              ]
+            },
+            {
+              "name": "devices_per_dp_cache (override selector)",
+              "expression": "devices_per_dp_cache = num_devices // tt_data_parallel",
+              "confidence": "from-source",
+              "constants": []
+            },
+            {
+              "name": "Code overrides for max_tokens_all_users (Wormhole only, is_wormhole_b0()==True)",
+              "expression": "Llama-3.1-8B & dppc==1 -> 32768; Qwen3-8B & dppc==1 -> 32768; (DeepSeek-R1-Distill-Qwen-14B OR Qwen2.5-14B) & dppc==2 -> 65536; Mistral-7B & dppc==1 -> 65536; gemma-3-4b & dppc in {1,2} -> 65536; Llama-3.2-90B & dppc==8 -> 65536; else super() -> 131072. (dppc = devices_per_dp_cache)",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "Llama-3.1-8B N150 budget",
+                  "value": "32768",
+                  "basis": "LlamaForCausalLM.get_max_tokens_all_users in generator_vllm.py"
+                },
+                {
+                  "name": "Qwen3-8B N150 budget",
+                  "value": "32768",
+                  "basis": "QwenForCausalLM override"
+                },
+                {
+                  "name": "DeepSeek-R1-Distill-Qwen-14B / Qwen2.5-14B N300 budget",
+                  "value": "65536",
+                  "basis": "QwenForCausalLM override, dppc==2"
+                },
+                {
+                  "name": "Mistral-7B N150 budget",
+                  "value": "65536",
+                  "basis": "MistralForCausalLM override"
+                },
+                {
+                  "name": "gemma-3-4b WH budget",
+                  "value": "65536",
+                  "basis": "Gemma3ForConditionalGeneration override, dppc in (1,2)"
+                },
+                {
+                  "name": "Llama-3.2-90B T3K budget",
+                  "value": "65536",
+                  "basis": "MllamaForConditionalGeneration override, dppc==8"
+                }
+              ]
+            },
+            {
+              "name": "block_size (paged-attention page, tokens)",
+              "expression": "block_size = 64 for every (model,device) entry in release 0.15.0",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "block_size",
+                  "value": "64",
+                  "basis": "every model_specs entry and vllm_args.block_size in release_model_spec.json"
+                }
+              ]
+            },
+            {
+              "name": "max_num_batched_tokens == max_model_len (prefill sizing)",
+              "expression": "vllm_args.max_num_batched_tokens == max_model_len for all observed entries",
+              "confidence": "from-source",
+              "constants": []
+            }
+          ],
+          "codeEvidence": [
+            {
+              "file": "tt-metal models/common/model_capabilities.py",
+              "symbol": "ModelCapabilitiesMixin.get_max_tokens_all_users / FALLBACK_MAX_TOKENS_ALL_USERS",
+              "snippet": "FALLBACK_MAX_TOKENS_ALL_USERS = 131_072\n\nclass ModelCapabilitiesMixin:\n    @classmethod\n    def get_max_tokens_all_users(cls, **kwargs) -> int:\n        \"\"\"Returns the fallback all-user KV-cache token capacity.\n        Used when no model- or device-specific override applies.\"\"\"\n        return FALLBACK_MAX_TOKENS_ALL_USERS",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/common/model_capabilities.py"
+            },
+            {
+              "file": "tt-metal models/tt_transformers/tt/generator_vllm.py",
+              "symbol": "LlamaForCausalLM.get_max_tokens_all_users",
+              "snippet": "devices_per_dp_cache = num_devices // tt_data_parallel\nis_wormhole = is_wormhole_b0()\nif \"Llama-3.1-8B\" in model_name and devices_per_dp_cache == 1 and is_wormhole:\n    return 32_768\nreturn super().get_max_tokens_all_users(...)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py"
+            },
+            {
+              "file": "tt-metal models/tt_transformers/tt/generator_vllm.py",
+              "symbol": "QwenForCausalLM.get_max_tokens_all_users",
+              "snippet": "if \"Qwen3-8B\" in model_name and devices_per_dp_cache == 1 and is_wormhole:\n    return 32_768\nif ((\"DeepSeek-R1-Distill-Qwen-14B\" in model_name or \"Qwen2.5-14B\" in model_name) and devices_per_dp_cache == 2 and is_wormhole):\n    return 65_536",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py"
+            },
+            {
+              "file": "tt-metal models/tt_transformers/tt/generator_vllm.py",
+              "symbol": "MistralForCausalLM / Gemma3 / Mllama overrides",
+              "snippet": "Mistral-7B & dppc==1 -> 65_536; gemma-3-4b (lower()) & dppc in (1,2) -> 65_536; Llama-3.2-90B & dppc==8 -> 65_536. is_wormhole_b0 imported from models.common.utility_functions",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py"
+            },
+            {
+              "file": "tt-inference-server release_model_spec.json",
+              "symbol": "Qwen/Qwen3-8B (N150/N300/T3K/GALAXY_T3K/P300)",
+              "snippet": "{\"hf_model_repo\":\"Qwen/Qwen3-8B\",\"status\":\"FUNCTIONAL\",\"max_model_len\":\"40960\",\"max_num_seqs\":\"32\",\"block_size\":\"64\",\"min_ram_gb\":20.0,\"vllm_args\":{\"max_num_batched_tokens\":\"40960\"}}  // GALAXY uses max_num_seqs \"128\"",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+            },
+            {
+              "file": "tt-inference-server release_model_spec.json",
+              "symbol": "Qwen/Qwen3-32B (GALAXY/T3K/GALAXY_T3K/P150X8/P300X2)",
+              "snippet": "GALAXY: status COMPLETE, max_model_len \"131072\", max_num_seqs \"8\", block_size \"64\", min_ram_gb 80.0, vllm_args.max_num_batched_tokens \"131072\", data_parallel_size 4. T3K/others: status FUNCTIONAL, max_num_seqs \"32\".",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+            },
+            {
+              "file": "tt-inference-server release_model_spec.json",
+              "symbol": "Qwen/QwQ-32B (T3K/GALAXY)",
+              "snippet": "status FUNCTIONAL, max_model_len \"131072\", block_size \"64\", min_ram_gb 80.0; T3K max_num_seqs \"32\", GALAXY max_num_seqs \"128\"; max_num_batched_tokens \"131072\".",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+            },
+            {
+              "file": "tt-inference-server release_model_spec.json",
+              "symbol": "mistralai/Mistral-7B-Instruct-v0.3 (N150/N300/T3K)",
+              "snippet": "status COMPLETE, max_model_len \"32768\", max_num_seqs \"32\", block_size \"64\", min_ram_gb 17.5, vllm_args.max_num_batched_tokens \"32768\".",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+            },
+            {
+              "file": "tt-inference-server release_model_spec.json",
+              "symbol": "openai/gpt-oss-20b & gpt-oss-120b",
+              "snippet": "gpt-oss-20b: T3K & GALAXY_T3K -> max_model_len \"16384\", max_num_seqs \"1\", min_ram_gb 50.0; GALAXY -> \"131072\", max_num_seqs \"32\", data_parallel_size 4. gpt-oss-120b: T3K -> \"16384\"/1/min_ram_gb 300.0; GALAXY -> \"131072\"/32/dp 4. status EXPERIMENTAL, block_size 64.",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+            },
+            {
+              "file": "tt-inference-server release_model_spec.json",
+              "symbol": "arcee-ai/AFM-4.5B (N300/T3K) & google/gemma-3-1b-it (N150)",
+              "snippet": "AFM-4.5B: status EXPERIMENTAL, max_model_len \"65536\", max_num_seqs \"32\", block_size \"64\", min_ram_gb 10.0, vllm_args incl max-log-len \"32\", seed \"9472\", additional_config '{\"tt\": {}}'. gemma-3-1b-it N150: EXPERIMENTAL, \"32768\"/32/block 64, min_ram_gb 2.5.",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+            },
+            {
+              "file": "tt-inference-server release_model_spec.json",
+              "symbol": "device_type enum (distinct values)",
+              "snippet": "T3K, GALAXY_T3K, GALAXY, N300, N150, P300, P150X8, P300X2",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json"
+            }
+          ],
+          "confidence": "high",
+          "formulas_note_ignore": "n/a",
+          "openQuestions": [
+            "Whether vllm_args.max_num_batched_tokens (==max_model_len) is the value actually passed as max_tokens_all_users at runtime, or whether the tt-metal get_max_tokens_all_users override takes precedence — the two can disagree (e.g. spec Qwen3-8B max_model_len 40960 vs code override 32768 for N150). Need to read where generator_vllm's value is consumed vs where model_spec injects max_num_batched_tokens into the vLLM engine.",
+            "Exact per-config KV byte formula from max_tokens_all_users (bytes = max_tokens_all_users * num_kv_heads_per_device * head_dim * 2(K,V) * num_layers * dtype_bytes, with paged rounding to block_size=64) was not confirmed in this angle; covered by KV-sizing angle.",
+            "release_model_spec.json stores numeric fields inconsistently as strings vs ints (e.g. max_num_seqs \"32\" vs 32); the calculator parser must coerce both.",
+            "Whether additional models (Llama-3.x, DeepSeek, gemma-3-4b/27b) ship in a different/newer release spec file — release 0.15.0's release_model_spec.json contains only the 8 repos listed; tt-metal code has overrides for models absent from this spec.",
+            "GALAXY data_parallel_size=4 implies the 32-chip mesh is 4 DP replicas of 8 chips each; need to confirm whether max_num_seqs and max_tokens budget are per-replica or aggregate across the 4 replicas."
+          ],
+          "sources": [
+            "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator_vllm.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/common/model_capabilities.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator.py",
+            "https://github.com/tenstorrent/tt-inference-server/issues/2491"
+          ]
+        },
+        "verification": {
+          "verdict": "minor-corrections",
+          "corrections": [
+            {
+              "claim": "Qwen3-8B entry min_ram_gb is 20.0 (the codeEvidence snippet shows min_ram_gb:20.0 attached to the Qwen3-8B example).",
+              "was": "min_ram_gb 20.0 (shown on the generic Qwen3-8B snippet)",
+              "shouldBe": "Qwen3-8B N150 has min_ram_gb 50.0; the N300/T3K/GALAXY_T3K/GALAXY/P300 variants have min_ram_gb 20.0. So 20.0 is correct for all variants EXCEPT N150 which is 50.0.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json (Qwen/Qwen3-8B N150 entry: \"min_ram_gb\": 50.0)"
+            },
+            {
+              "claim": "Qwen/Qwen3-32B GALAXY entry: a single COMPLETE entry with max_num_seqs 8 and data_parallel_size 4.",
+              "was": "One GALAXY entry (status COMPLETE, max_num_seqs \"8\", data_parallel_size 4).",
+              "shouldBe": "There are TWO distinct Qwen3-32B GALAXY entries: (a) status COMPLETE, max_num_seqs 8 (stored as int), data_parallel_size 4, trace_region_size 184915840; (b) status FUNCTIONAL, max_num_seqs \"32\" (string), data_parallel_size 4, trace_region_size 66147328. The calculator parser must handle duplicate (model, device_type) keys distinguished by status/impl.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json (two Qwen/Qwen3-32B device_type=GALAXY objects)"
+            },
+            {
+              "claim": "Mistral-7B-Instruct-v0.3 min_ram_gb 17.5 across N150/N300/T3K.",
+              "was": "min_ram_gb 17.5 (correct) but vllm_args described only generically.",
+              "shouldBe": "No correction to numbers; note that all three Mistral variants additionally carry vllm_args max-log-len \"32\" and seed \"9472\" (matching the AFM/Qwen3-8B-N150 pattern). This is an addition, not an error.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/tt-inference-server/main/release_model_spec.json (mistralai/Mistral-7B-Instruct-v0.3 N150/N300/T3K)"
+            }
+          ],
+          "confirmed": [
+            "FALLBACK_MAX_TOKENS_ALL_USERS = 131_072, returned by ModelCapabilitiesMixin.get_max_tokens_all_users(cls, **kwargs) -> int as `return FALLBACK_MAX_TOKENS_ALL_USERS` (models/common/model_capabilities.py)",
+            "devices_per_dp_cache = num_devices // tt_data_parallel — computed identically in every get_max_tokens_all_users override (generator_vllm.py)",
+            "Import line verbatim: `from models.common.utility_functions import is_wormhole_b0, nearest_32`",
+            "LlamaForCausalLM: if \"Llama-3.1-8B\" in model_name and devices_per_dp_cache == 1 and is_wormhole: return 32_768",
+            "QwenForCausalLM: if \"Qwen3-8B\" in model_name and devices_per_dp_cache == 1 and is_wormhole: return 32_768",
+            "QwenForCausalLM: if ((\"DeepSeek-R1-Distill-Qwen-14B\" in model_name or \"Qwen2.5-14B\" in model_name) and devices_per_dp_cache == 2 and is_wormhole): return 65_536",
+            "MistralForCausalLM: if \"Mistral-7B\" in model_name and devices_per_dp_cache == 1 and is_wormhole: return 65_536",
+            "Gemma3ForConditionalGeneration: if \"gemma-3-4b\" in model_name.lower() and devices_per_dp_cache in (1, 2) and is_wormhole: return 65_536",
+            "MllamaForConditionalGeneration: if \"Llama-3.2-90B\" in model_name and devices_per_dp_cache == 8 and is_wormhole: return 65_536",
+            "All overrides fall through to super().get_max_tokens_all_users(...) i.e. 131072 when no condition matches",
+            "release_model_spec.json top-level: schema_version \"0.1.0\", release_version \"0.15.0\"",
+            "block_size is \"64\" (string) for EVERY model_specs entry and every vllm_args.block_size",
+            "vllm_args.max_num_batched_tokens == max_model_len for EVERY entry in the release (no mismatches)",
+            "The 8 distinct hf_model_repo values: openai/gpt-oss-20b, openai/gpt-oss-120b, arcee-ai/AFM-4.5B, google/gemma-3-1b-it, Qwen/Qwen3-8B, Qwen/Qwen3-32B, mistralai/Mistral-7B-Instruct-v0.3, Qwen/QwQ-32B (NO Llama models present)",
+            "device_type enum distinct values: T3K, GALAXY_T3K, GALAXY, N300, N150, P300, P150X8, P300X2",
+            "Qwen3-8B: max_model_len \"40960\", max_num_seqs \"32\" (GALAXY uses \"128\"), block_size \"64\", max_num_batched_tokens \"40960\"",
+            "Qwen3-32B: max_model_len \"131072\", block_size \"64\", min_ram_gb 80.0, max_num_batched_tokens \"131072\"; GALAXY entries carry data_parallel_size 4",
+            "Mistral-7B-Instruct-v0.3 N150/N300/T3K: status COMPLETE, max_model_len \"32768\", max_num_seqs \"32\", block_size \"64\", min_ram_gb 17.5, max_num_batched_tokens \"32768\"",
+            "gpt-oss-20b: T3K & GALAXY_T3K -> max_model_len \"16384\"/max_num_seqs \"1\"/min_ram_gb 50.0/no dp; GALAXY -> \"131072\"/\"32\"/data_parallel_size 4. status EXPERIMENTAL",
+            "gpt-oss-120b: T3K -> \"16384\"/\"1\"/min_ram_gb 300.0/no dp; GALAXY -> \"131072\"/max_num_seqs 32 (INTEGER)/min_ram_gb 300.0/data_parallel_size 4. status EXPERIMENTAL",
+            "AFM-4.5B N300/T3K: status EXPERIMENTAL, max_model_len \"65536\", max_num_seqs \"32\", block_size \"64\", min_ram_gb 10.0, max_num_batched_tokens \"65536\"",
+            "gemma-3-1b-it N150: status EXPERIMENTAL, max_model_len \"32768\", max_num_seqs \"32\", block_size \"64\", min_ram_gb 2.5, max_num_batched_tokens \"32768\"",
+            "QwQ-32B: T3K status FUNCTIONAL max_num_seqs \"32\"; GALAXY status FUNCTIONAL max_num_seqs \"128\"; both max_model_len \"131072\", block_size \"64\", min_ram_gb 80.0, max_num_batched_tokens \"131072\", no data_parallel_size",
+            "String-vs-int inconsistency confirmed: most numeric fields are strings (e.g. \"32\", \"131072\"), but Qwen3-32B GALAXY-COMPLETE max_num_seqs is int 8, gpt-oss-120b GALAXY max_num_seqs is int 32, and data_parallel_size is always an int (4); min_ram_gb is always a float (e.g. 80.0, 2.5)"
+          ],
+          "summary": "Re-fetched all four load-bearing sources and confirmed the token-budget investigation is accurate. CONFIRMED VERBATIM: (1) FALLBACK_MAX_TOKENS_ALL_USERS = 131_072 with the exact mixin body returning it. (2) All six get_max_tokens_all_users overrides in generator_vllm.py, including exact model-name substrings, devices_per_dp_cache values, the is_wormhole_b0 gate, and integer returns (Llama-3.1-8B/Qwen3-8B dppc==1 -> 32_768; Mistral-7B dppc==1 -> 65_536; DeepSeek-R1-Distill-Qwen-14B/Qwen2.5-14B dppc==2 -> 65_536; gemma-3-4b dppc in (1,2) -> 65_536; Llama-3.2-90B dppc==8 -> 65_536; else super()). devices_per_dp_cache = num_devices // tt_data_parallel is computed identically in every override. (3) release_model_spec.json schema 0.1.0 / release 0.15.0; block_size is \\\"64\\\" everywhere; max_num_batched_tokens == max_model_len for every entry (no mismatches); the 8 repos and 8 device_type values match; NO Llama models in this release. The KV-budget resolution order and the spec caps are all source-accurate.\\n\\nTHREE MINOR CORRECTIONS/ADDITIONS, none affecting the formulas: (a) Qwen3-8B N150 has min_ram_gb 50.0, not 20.0 — the investigation's codeEvidence snippet attached 20.0 to the generic Qwen3-8B example, which is right for N300/T3K/GALAXY_T3K/GALAXY/P300 but wrong for N150. (b) Qwen/Qwen3-32B has TWO distinct GALAXY entries, not one: a COMPLETE entry (max_num_seqs int 8, trace_region_size 184915840) AND a FUNCTIONAL entry (max_num_seqs \\\"32\\\", trace_region_size 66147328) — the parser must handle duplicate (model, device_type) keys. (c) The string-vs-int inconsistency is confirmed and slightly broader than noted: data_parallel_size is always int 4, min_ram_gb is always a float, max_num_seqs is mostly string but int in two GALAXY entries (Qwen3-32B-COMPLETE=8, gpt-oss-120b=32). The investigation's open questions (max_num_batched_tokens vs code-override precedence at runtime; per-replica vs aggregate GALAXY budget; exact KV byte formula) remain genuinely open and are out of scope for this source re-read."
+        }
+      },
+      {
+        "key": "activations",
+        "investigation": {
+          "area": "Activation / Prefill Workspace Memory (TT tt_transformers + tt-vllm)",
+          "summary": "## Mechanism: where activations live and how prefill workspace scales\n\n**Prefill activations live in DRAM; decode activations live in L1 SRAM.** This is hard-coded by mode in `models/tt_transformers/tt/model_config.py`. Every per-layer memory-config getter returns `ttnn.DRAM_MEMORY_CONFIG` for `Mode.PREFILL` and a sharded-L1 config (`L1_WIDTH_SHARDED_MEMORY_CONFIG` / `L1_MEMORY_CONFIG` / `create_sharded_memory_config`) for `Mode.DECODE`. Confirmed for QKV matmul (`get_attn_qkv_mm_mem_config`, prefill→DRAM line 1678, decode→L1 line 1676), MLP FF1/FF3 (`get_mlp_ff1_3_mem_config`, prefill→DRAM 1354, decode→L1 1352), MLP FF2 (`get_mlp_ff2_mem_config`, prefill→DRAM 1374, decode→L1 1372), and residual stream (`get_residual_mem_config`, prefill→DRAM 1191, decode→sharded-L1 1177-1188).\n\n**Consequence for the DRAM budget:** decode activations are sharded into L1 (on-chip SRAM, ~1-1.5 MB/core), NOT DRAM — so for a VRAM/DRAM calculator, **decode-phase activations are negligible to the DRAM budget**. The DRAM activation cost is dominated by the *prefill* phase.\n\n**Prefill is internally chunked (this is the key bound).** Even though tt-vllm disables vLLM-level *chunked prefill* (SCHEDULING.md: \"no chunked prefill\", \"no mixed prefill+decode batch\", each step is \"prefill-only, decode-only, empty step\"), the tt-metal model **internally splits a long prompt into fixed-size chunks** in `Generator.prefill_forward_single_user_text` (generator.py:1093-1164). The loop `for chunk_start in range(num_cached_tokens, num_cached_tokens + seq_len, chunk_size)` processes the prompt `chunk_size` tokens at a time, where `chunk_size = get_max_prefill_chunk_size(seq_len, max_prefill_chunk_size)`. `max_prefill_chunk_size = max_prefill_chunk_size_div1024 * 1024` tokens (model_config.py:2395), looked up per (model, device) from `MAX_PREFILL_CHUNK_SIZES_DIV1024` (e.g. Llama-3.1-8B on N300 = 64→65536 tokens; on N150 = 4→4096; Llama-3.1-70B on T3K = 32→32768). The chunking exists precisely to cap on-chip workspace: the source comment says \"if you run out of L1 memory it was too high\" (model_config.py:2387).\n\n**Within a chunk, activations are tiled/reshaped to keep the matmul M-dim bounded.** Attention prefill reshapes the QKV input when `seq_len > MAX_QKV_MM_SEQ_LEN` (=2048) into `[1, seq_len//2048, 2048, -1]`, and reshapes the attention output when `seq_len > 1024` into `[1, seq_len//1024, 1024, -1]` (attention.py forward_prefill). MLP prefill reshapes when `seq_len >= prefill_len_cutoff` (=1024 Wormhole, 512 Blackhole) into `[1, seq_len//cutoff, cutoff, -1]` (mlp.py). These are *logical* tile foldings of a DRAM tensor, not extra allocations.\n\n## Implied DRAM activation formula (order-of-magnitude)\n\nThe dominant resident prefill activation tensors in DRAM are O(chunk × hidden) and O(chunk × intermediate), plus the per-chunk attention scores. With activations in bf16 (2 B) or bf8_b (1 B):\n\n- Per-chunk hidden/residual activation ≈ `chunk_tokens × hidden_size × bytes_per_elem`\n- Per-chunk MLP intermediate (FF1/FF3 output) ≈ `chunk_tokens × intermediate_size × bytes_per_elem`\n- Per-chunk attention scores (SDPA, internal) ≈ `num_heads × chunk_tokens × (chunk_tokens + cached_tokens) × bytes` (only resident transiently per chunk; bounded because chunk caps the query dimension)\n\nBecause the prompt is processed `chunk_size` tokens at a time and chunk activations are freed/reused between chunks, the *peak* prefill activation DRAM does NOT grow linearly with the full `seq_len`; it is bounded by `chunk_size` (≤ `max_prefill_chunk_size`), not the full prompt length. So a safe **upper bound** for resident prefill activation workspace per device:\n\n`prefill_act_dram ≈ k × chunk_tokens × max(hidden_size, intermediate_size) × bytes_per_elem`\n\nwith `chunk_tokens = min(seq_len, max_prefill_chunk_size)` and a small constant `k` (a handful of live tensors). This is tens-to-low-hundreds of MB, dwarfed by weights and KV-cache, but it does grow with chunk_size and hidden/intermediate dims.\n\n## Exact vs estimated\n- EXACT (verbatim source): DRAM-for-prefill / L1-for-decode placement; chunk loop and `chunk_size = max_prefill_chunk_size_div1024 × 1024`; the `MAX_PREFILL_CHUNK_SIZES_DIV1024` table; `MAX_QKV_MM_SEQ_LEN=2048`; `prefill_len_cutoff=512/1024`; reshape thresholds (>2048 QKV, >1024 attn out, >=cutoff MLP); no vLLM chunked prefill (SCHEDULING.md).\n- ESTIMATED/INFERRED: the closed-form byte formula and the constant `k` — tt-metal does not expose a single \"activation bytes\" number; SDPA scratch and tile-padding overheads are allocator-internal. The bound (peak ∝ chunk_size, not full seq_len) is inferred from the chunk loop structure, marked low/medium confidence for exact bytes.",
+          "formulas": [
+            {
+              "name": "max_prefill_chunk_size (tokens)",
+              "expression": "max_prefill_chunk_size = MAX_PREFILL_CHUNK_SIZES_DIV1024[base_model_name][device_name] * 1024  ; if model/device unknown, default div1024 = 4 (=> 4096 tokens)",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "Llama-3.1-8B div1024",
+                  "value": "N150=4, N300=64, T3K=128, TG=128, P150x4=128",
+                  "basis": "model_config.py:2353 MAX_PREFILL_CHUNK_SIZES_DIV1024"
+                },
+                {
+                  "name": "Llama-3.1-70B div1024",
+                  "value": "N150=None, N300=None, T3K=32, TG=128, P150x4=128",
+                  "basis": "model_config.py:2355"
+                },
+                {
+                  "name": "Qwen2.5-72B div1024",
+                  "value": "T3K=16, TG=128, P150x4=128",
+                  "basis": "model_config.py:2360"
+                },
+                {
+                  "name": "default_div1024_on_unknown",
+                  "value": "4",
+                  "basis": "model_config.py:2389 fallback"
+                },
+                {
+                  "name": "KB_per_unit",
+                  "value": "1024",
+                  "basis": "model_config.py:2395 return ...*1024"
+                }
+              ]
+            },
+            {
+              "name": "prefill chunk count",
+              "expression": "num_chunks = ceil(seq_len / chunk_size), where chunk_size = min(seq_len, max_prefill_chunk_size); prompt processed via `for chunk_start in range(num_cached_tokens, num_cached_tokens+seq_len, chunk_size)`",
+              "confidence": "from-source",
+              "constants": []
+            },
+            {
+              "name": "peak prefill activation DRAM (upper bound, per device)",
+              "expression": "prefill_act_dram_bytes ~= k * chunk_tokens * max(hidden_size, intermediate_size) * bytes_per_elem, with chunk_tokens = min(seq_len, max_prefill_chunk_size); k a small constant (~2-4 live tensors). Peak is bounded by chunk_size, NOT full seq_len, because per-chunk activations are reused across chunks.",
+              "confidence": "inferred",
+              "constants": [
+                {
+                  "name": "bytes_per_elem",
+                  "value": "2 (bfloat16) or 1 (bfloat8_b)",
+                  "basis": "activation_dtype defaults bf16; ccl_dtype=bfloat8_b (model_config.py:1029); attention.py uses self.activation_dtype or ttnn.bfloat16"
+                },
+                {
+                  "name": "k",
+                  "value": "~2 to 4",
+                  "basis": "inferred: residual + MLP intermediate + transient SDPA scratch; not a single source constant"
+                }
+              ]
+            },
+            {
+              "name": "attention prefill QKV tile reshape threshold",
+              "expression": "if seq_len > MAX_QKV_MM_SEQ_LEN: x = reshape(x, [1, seq_len//MAX_QKV_MM_SEQ_LEN, MAX_QKV_MM_SEQ_LEN, -1])",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "MAX_QKV_MM_SEQ_LEN",
+                  "value": "2048",
+                  "basis": "model_config.py:489 and :1615"
+                }
+              ]
+            },
+            {
+              "name": "attention prefill output reshape threshold",
+              "expression": "if seq_len > 1024: attn_output = reshape(attn_output, [1, seq_len//1024, 1024, -1])",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "attn_out_cutoff",
+                  "value": "1024",
+                  "basis": "attention.py forward_prefill"
+                }
+              ]
+            },
+            {
+              "name": "MLP prefill reshape threshold",
+              "expression": "if mode==PREFILL and seq_len >= prefill_len_cutoff: x = reshape(x, [1, seq_len//prefill_len_cutoff, prefill_len_cutoff, -1])",
+              "confidence": "from-source",
+              "constants": [
+                {
+                  "name": "prefill_len_cutoff",
+                  "value": "512 if is_blackhole() else 1024 (reduced to 512 for some models)",
+                  "basis": "model_config.py:534, 606, 608"
+                }
+              ]
+            },
+            {
+              "name": "decode activation DRAM contribution",
+              "expression": "decode_act_dram_bytes ~= 0 (decode activations are sharded into L1 SRAM, not DRAM)",
+              "confidence": "from-source",
+              "constants": []
+            }
+          ],
+          "codeEvidence": [
+            {
+              "file": "models/tt_transformers/tt/model_config.py",
+              "symbol": "get_mlp_ff1_3_mem_config",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py",
+              "snippet": "if mode == Mode.DECODE:\n    ...\n    return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG\nelif mode == Mode.PREFILL:\n    return ttnn.DRAM_MEMORY_CONFIG"
+            },
+            {
+              "file": "models/tt_transformers/tt/model_config.py",
+              "symbol": "get_residual_mem_config",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py",
+              "snippet": "if mode == Mode.DECODE:\n    ... create_sharded_memory_config(...) / ttnn.L1_MEMORY_CONFIG\nelif mode == Mode.PREFILL:\n    return ttnn.DRAM_MEMORY_CONFIG"
+            },
+            {
+              "file": "models/tt_transformers/tt/model_config.py",
+              "symbol": "get_max_prefill_chunk_size",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py",
+              "snippet": "MAX_PREFILL_CHUNK_SIZES_DIV1024 = {\n  \"Llama-3.1-8B\": {\"N150\": 4, \"N300\": 64, \"T3K\": 128, \"TG\": 128, \"P150x4\": 128},\n  \"Llama-3.1-70B\": {\"N150\": None, \"N300\": None, \"T3K\": 32, \"TG\": 128, \"P150x4\": 128},\n  ...}\n... max_prefill_chunk_size_div1024 = 4  # fallback for unknown\nreturn max_prefill_chunk_size_div1024 * 1024"
+            },
+            {
+              "file": "models/tt_transformers/tt/model_config.py",
+              "symbol": "fallback warning",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py",
+              "snippet": "\"Try setting MAX_PREFILL_CHUNK_SIZE to larger powers of 2 up to e.g. 128 for faster performance (if you run out of L1 memory it was too high)\""
+            },
+            {
+              "file": "models/tt_transformers/tt/generator.py",
+              "symbol": "prefill_forward_single_user_text (internal chunk loop)",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator.py",
+              "snippet": "if use_chunked_prefill:\n    chunk_size = get_max_prefill_chunk_size(seq_len, self.model_args[model_id].max_prefill_chunk_size)\nelse:\n    chunk_size = seq_len\n...\nfor chunk_start in range(num_cached_tokens, num_cached_tokens + seq_len, chunk_size):\n    chunk_tokens = tokens[:, chunk_start_relative:chunk_end_relative]\n    chunk_inputs = self.model[model_id].prepare_inputs_prefill(chunk_tokens, start_pos=chunk_start, ...)\n    tt_logits = self.model[model_id].ttnn_prefill_forward(chunk_prefill_input, ...)"
+            },
+            {
+              "file": "models/tt_transformers/tt/model_config.py",
+              "symbol": "MAX_QKV_MM_SEQ_LEN / prefill_len_cutoff",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py",
+              "snippet": "MAX_QKV_MM_SEQ_LEN = 2048   # line 489\nself.MAX_QKV_MM_SEQ_LEN = 2048  # line 1615\nself.prefill_len_cutoff = 512 if is_blackhole() else 1024  # line 534"
+            },
+            {
+              "file": "models/tt_transformers/tt/attention.py",
+              "symbol": "forward_prefill reshape thresholds",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/attention.py",
+              "snippet": "if seq_len > self.MAX_QKV_MM_SEQ_LEN:\n    x_11SH = ttnn.reshape(x_11SH, [1, seq_len // self.MAX_QKV_MM_SEQ_LEN, self.MAX_QKV_MM_SEQ_LEN, -1])\n...\nif seq_len > 1024:\n    attn_output_11SH = ttnn.reshape(attn_output_11SH, [1, seq_len // 1024, 1024, -1])"
+            },
+            {
+              "file": "models/tt_transformers/tt/mlp.py",
+              "symbol": "forward prefill reshape",
+              "url": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/mlp.py",
+              "snippet": "if mode == Mode.PREFILL and seq_len >= self.args.prefill_len_cutoff:\n    x = ttnn.reshape(x, [1, seq_len // self.args.prefill_len_cutoff, self.args.prefill_len_cutoff, -1])"
+            },
+            {
+              "file": "plugins/vllm-tt-plugin/docs/SCHEDULING.md",
+              "symbol": "prefill/decode separation, no chunked prefill",
+              "url": "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/docs/SCHEDULING.md",
+              "snippet": "\"no mixed prefill+decode batch\"; \"each TT scheduling step picks one of: prefill-only, decode-only, empty step\"; \"no chunked prefill\"; \"TT prefill still behaves like a synchronous step in practice. The meaningful overlap optimization is decode.\""
+            }
+          ],
+          "confidence": "high",
+          "sources": [
+            "https://raw.githubusercontent.com/tenstorrent/vllm/dev/plugins/vllm-tt-plugin/docs/SCHEDULING.md",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model_config.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/attention.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/mlp.py",
+            "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/model.py"
+          ],
+          "openQuestions": [
+            "Exact byte-accounting of the SDPA scratch buffer during prefill (num_heads x chunk x (chunk+cached) attention scores) is allocator-internal; tt-metal does not expose a single activation-bytes constant, so the constant k in the bound is inferred not measured.",
+            "Whether activation_dtype defaults to bf16 or bf8_b per model — code uses `self.activation_dtype or ttnn.bfloat16` so default is bf16 unless a model overrides; ccl_dtype is bfloat8_b. This affects bytes_per_elem (1 vs 2).",
+            "MAX_BATCHED_PREFILL_SEQ_LEN limit (referenced in generator.py:681) gates batched prefill; its numeric value was not extracted and would further cap multi-user prefill activation."
+          ]
+        },
+        "verification": {
+          "verdict": "minor-corrections",
+          "corrections": [
+            {
+              "claim": "Investigation states activation_dtype 'default is bf16 unless a model overrides' (open question #2), implying bytes_per_elem defaults to 2.",
+              "was": "Default activation dtype is bf16 (2 bytes) via `self.activation_dtype or ttnn.bfloat16`.",
+              "shouldBe": "It is mixed within a single attention layer. activation_dtype is set from `decoders_optimizations.get_tensor_dtype(decoder_id=layer_num, tensor=TensorGroup.ACTIVATION, ...)` (attention.py:116) and may be None. The QKV-input matmul path falls back to bf16: `dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16` (attention.py:599, 918). BUT the q_heads/SDPA path and the wo-output path fall back to bf8_b: `q_heads_1QSD_8b = ttnn.typecast(q_heads_1QSD, dtype=self.activation_dtype or ttnn.bfloat8_b)` (attention.py:1065), and `dtype=self.activation_dtype or ttnn.bfloat8_b` for the SDPA-region linear and wo output (attention.py:1160). So bytes_per_elem is NOT uniformly 2; the attention-score/SDPA tensors default to 1 byte (bf8_b) when activation_dtype is None.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/attention.py lines 116, 599, 918, 1065, 1160"
+            },
+            {
+              "claim": "Open question #3: 'MAX_BATCHED_PREFILL_SEQ_LEN limit (referenced in generator.py:681) ... its numeric value was not extracted.'",
+              "was": "Numeric value of MAX_BATCHED_PREFILL_SEQ_LEN unknown / not extracted.",
+              "shouldBe": "MAX_BATCHED_PREFILL_SEQ_LEN = 128 * 1024 (i.e. 131072 tokens), defined at generator.py:41. The gate at line 681 disables batched prefill when `padded_batch * prefill_seq_lens[0] >= MAX_BATCHED_PREFILL_SEQ_LEN` (and similarly at line 163: `if batch_size > 1 and batch_size * supported_length >= MAX_BATCHED_PREFILL_SEQ_LEN`). This caps the total batched-prefill token product at 131072, which bounds multi-user prefill activation workspace.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator.py lines 41, 163, 681-684"
+            },
+            {
+              "claim": "Codified chunk loop shows `if use_chunked_prefill:` without defining the predicate.",
+              "was": "The snippet implies use_chunked_prefill is an externally supplied flag.",
+              "shouldBe": "use_chunked_prefill is computed locally as `use_chunked_prefill = seq_len > self.model_args[model_id].max_prefill_chunk_size` (generator.py:1074). So internal chunking engages ONLY when seq_len exceeds max_prefill_chunk_size; otherwise chunk_size = seq_len (line 1098) and the whole prompt is one chunk. This sharpens the bound: peak prefill-activation workspace scales with chunk_tokens = min(seq_len, max_prefill_chunk_size), exactly as the investigation concluded, but the trigger condition is now confirmed verbatim.",
+              "source": "https://raw.githubusercontent.com/tenstorrent/tt-metal/main/models/tt_transformers/tt/generator.py lines 1074, 1093-1098"
+            }
+          ],
+          "confirmed": [
+            "model_config.py:489 `MAX_QKV_MM_SEQ_LEN = 2048` (class-level) and :1615 `self.MAX_QKV_MM_SEQ_LEN = 2048` (instance) — both verbatim correct.",
+            "model_config.py:534 `self.prefill_len_cutoff = 512 if is_blackhole() else 1024` — verbatim. Reduced to 512 for specific (model,device) combos at lines 605-608 (e.g. Llama-3.1-8B/Mistral-7B/gemma/Phi-4 on N150; Qwen2.5-7B/Phi-4 on N300; Mixtral-8x7B on T3K).",
+            "model_config.py:1029 `self.ccl_dtype = ttnn.bfloat8_b` — verbatim (1 byte for CCL/all-gather tensors).",
+            "model_config.py get_residual_mem_config: DECODE returns create_sharded_memory_config / (is_galaxy → ttnn.L1_MEMORY_CONFIG at :1176); PREFILL returns `ttnn.DRAM_MEMORY_CONFIG` at line 1191 — verbatim.",
+            "model_config.py get_mlp_ff1_3_mem_config (def :1339): DECODE returns ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG at :1352; PREFILL returns ttnn.DRAM_MEMORY_CONFIG at :1354 — verbatim.",
+            "model_config.py get_mlp_ff2_mem_config (def :1359): DECODE L1_WIDTH_SHARDED at :1372; PREFILL DRAM at :1374 — verbatim.",
+            "model_config.py get_attn_qkv_mm_mem_config (def :1658): DECODE L1_WIDTH_SHARDED_MEMORY_CONFIG at :1676 (or create_sharded_memory_config when prefetcher); PREFILL DRAM at :1678 — verbatim. Confirms prefill activations live in DRAM, decode activations sharded into L1.",
+            "model_config.py:2350-2379 MAX_PREFILL_CHUNK_SIZES_DIV1024 dictionary verbatim. Llama-3.1-8B {N150:4,N300:64,T3K:128,TG:128,P150x4:128}; Llama-3.1-70B {N150:None,N300:None,T3K:32,TG:128,P150x4:128}; Qwen2.5-72B {N150:None,N300:None,T3K:16,TG:128,P150x4:128,P150x8:128}. All match the investigation exactly.",
+            "model_config.py:2345-2395 get_max_prefill_chunk_size: env-var MAX_PREFILL_CHUNK_SIZE override; else dict lookup `MAX_PREFILL_CHUNK_SIZES_DIV1024[self.base_model_name][self.device_name]`; on KeyError fallback `max_prefill_chunk_size_div1024 = 4` (line 2389) with warning string 'Try setting MAX_PREFILL_CHUNK_SIZE to larger powers of 2 up to e.g. 128 for faster performance (if you run out of L1 memory it was too high)' (line 2387); asserts not-None; returns `max_prefill_chunk_size_div1024 * 1024` (line 2395). All verbatim.",
+            "attention.py:904-905 forward_prefill QKV reshape: `if seq_len > self.MAX_QKV_MM_SEQ_LEN: x_11SH = ttnn.reshape(x_11SH, [1, seq_len // self.MAX_QKV_MM_SEQ_LEN, self.MAX_QKV_MM_SEQ_LEN, -1])` — verbatim. Also pads seq_len up to a multiple of MAX_QKV_MM_SEQ_LEN at lines 895-899.",
+            "attention.py:1137-1138 attn output reshape: `if seq_len > 1024: attn_output_11SH = ttnn.reshape(attn_output_11SH, [1, seq_len // 1024, 1024, -1])` — verbatim. And wo-output reshape back `if seq_len > 1024: output_11SH = ttnn.reshape(output_11SH, [1, 1, seq_len, -1])` at lines 1165-1166.",
+            "mlp.py prefill reshape: `if mode == Mode.PREFILL and seq_len >= self.args.prefill_len_cutoff: x = ttnn.reshape(x, [1, seq_len // self.args.prefill_len_cutoff, self.args.prefill_len_cutoff, -1])` — verbatim.",
+            "generator.py prefill_forward_single_user_text chunk loop: `chunk_size = get_max_prefill_chunk_size(seq_len, self.model_args[model_id].max_prefill_chunk_size)` (line 1095) else `chunk_size = seq_len` (1098); `for chunk_start in range(num_cached_tokens, num_cached_tokens + seq_len, chunk_size):` with prepare_inputs_prefill + ttnn_prefill_forward in body — verbatim. block_size obtained via `get_block_size(kv_cache)` (line 1101) and page_table sliced `[:, chunk_start // block_size : chunk_end // block_size]` (line 1134).",
+            "SCHEDULING.md (tenstorrent/vllm dev branch): verbatim phrases 'no chunked prefill', 'TT does not support chunked prefill at the scheduling level', 'no mixed prefill+decode batch', 'each TT scheduling step picks one of: prefill-only, decode-only, empty step', 'TT prefill still behaves like a synchronous step in practice. The meaningful overlap optimization is decode.' — all confirmed."
+          ],
+          "summary": "I re-fetched all six source files (tt-metal model_config.py, attention.py, mlp.py, generator.py; tenstorrent/vllm SCHEDULING.md) and confirmed every load-bearing claim in the activation investigation is verbatim-correct. The prefill→DRAM / decode→L1-sharded placement, the chunk loop, chunk_size = div1024 entry * 1024 with fallback 4, the MAX_PREFILL_CHUNK_SIZES_DIV1024 table, MAX_QKV_MM_SEQ_LEN=2048, prefill_len_cutoff=512(BH)/1024(WH), the reshape thresholds, ccl_dtype=bfloat8_b, and the four SCHEDULING.md statements all match source exactly. Line numbers cited in the investigation are accurate.\\n\\nThree refinements (none contradict the formulas):\\n\\n1. activation_dtype is NOT uniformly bf16. It is set from decoders_optimizations.get_tensor_dtype(TensorGroup.ACTIVATION) and may be None; the QKV-input matmul falls back to bf16 (2B) but the q_heads/SDPA and wo-output paths fall back to bf8_b (1B). So bytes_per_elem for the attention-score/SDPA workspace defaults to 1, not 2, when activation_dtype is unset. This makes the investigation's transient SDPA-scratch term potentially smaller than a uniform-bf16 assumption.\\n\\n2. Open question #3 is now resolved: MAX_BATCHED_PREFILL_SEQ_LEN = 128 * 1024 = 131072 (generator.py:41). Batched prefill is disabled when padded_batch * prefill_seq_len >= 131072 (lines 163, 681), which caps multi-user prefill activation workspace.\\n\\n3. The chunking trigger is confirmed and sharpened: use_chunked_prefill = seq_len > max_prefill_chunk_size (generator.py:1074). When false, chunk_size = seq_len (whole prompt in one chunk). This validates the investigation's core bound: peak prefill activation DRAM scales with chunk_tokens = min(seq_len, max_prefill_chunk_size), NOT full seq_len.\\n\\nNote on scope: this investigation covers ACTIVATIONS only. The user's priority list (block-float KV byte costs, KV block-count formula and block_size, what shards vs replicates, usable-DRAM-per-chip, trace_region_size) is largely outside this activation investigation's claims. I confirmed the activation-adjacent items that appear here (block_size is obtained at runtime via get_block_size(kv_cache) and is NOT a hardcoded constant in this file; page-table indexing divides token offsets by block_size). The KV-cache byte formula, trace_region_size, and usable-DRAM-per-chip are not asserted in this activation output and would need verification against the KV-cache/device investigations, which are out of scope for this verification pass. The inferred closed-form byte formula and constant k remain inferred (not in source), as the investigation itself flagged."
+        }
+      }
+    ],
+    "synthesis": {
+      "proposedFormula": "// ============================================================================\n// TENSTORRENT PER-CHIP VRAM MODEL  (replaces the flat aggregate \"fits if total <= sum(chip GB)\" check)\n// Default precision profile = DecodersPrecision.performance (the realistic vLLM serving default).\n// All sizes in BYTES unless noted. GiB = 2^30.\n// ============================================================================\n\n// ---- 0. INPUTS ----\n// model: paramsTotalB, hiddenSize, attention{numLayers, numKvHeads, headDim, kind...}, moe, intermediateSize, ffnGated(bool), vocabSize\n// hardware (TT SKU): arch in {WH, BH}, numChips, meshShape=[rows,cols] (e.g. N150=[1,1], N300=[1,2], T3K=[1,8], Galaxy=[8,4]), ttDataParallel\n// model_spec entry (per model+device): maxModelLen, maxNumSeqs (=batch S), blockSize (=64), traceRegionBytes (0 if absent), maxTokensAllUsersOverride?\n// precisionProfile in {performance(default), accuracy}; perTensorBpw map derived below\n\n// ---- 1. EFFECTIVE WEIGHT BYTES-PER-PARAM (mixed block-float) ----\n// Block-float byte costs (DERIVED from 16-elem shared-exponent tile, NOT a source constant but standard):\nconst BPW = { BFP4: 0.5625 /* 9/16 */, BFP8: 1.0625 /* 17/16 */, BF16: 2.0 };\n// performance profile per TensorGroup (default): FF1_FF3=BFP4; FF2=BFP8; WQKV=BFP8; WO=BFP8; KV_CACHE=BFP8\n// (per-model exceptions: Qwen2.5-7B/VL-7B -> WQKV/WO/KV=BF16, FFN stays BFP8 (no BFP4); GPT-OSS -> experts MXFP4 ~0.55, attn bf16/bfp8)\n// Compute the per-decoder weight param split FROM MODEL DIMS (source does not store s_* constants):\n//   d_q   = numAttnHeads * headDim;   d_kv = numKvHeads * headDim\n//   attnParamsPerLayer = hidden*(d_q + 2*d_kv)  [WQKV]  +  hidden*hidden [WO]\n//   ffnParamsPerLayer  = (ffnGated ? 3 : 2) * hidden * intermediateSize   // dense; MoE: * numExperts (ALL experts resident)\n//   f_attn = attnParamsPerLayer / (attnParamsPerLayer + ffnParamsPerLayer);  f_ffn = 1 - f_attn\n//   within attn: s_qkv = (d_q+2*d_kv)/(d_q+2*d_kv + hidden); s_wo = 1 - s_qkv\n//   within ffn (SwiGLU/gated): s_13 = 2/3, s_2 = 1/3;  (non-gated): s_13 = 1/2, s_2 = 1/2\n// effective_bpw applies ONLY to the in-decoder weights; embeddings/lm_head/norms ride at their own dtype (treat as BF16 default unless quantized):\neffective_bpw_decoder =\n    f_attn * ( s_qkv*BPW[WQKV] + s_wo*BPW[WO] )\n  + f_ffn  * ( s_13 *BPW[FF1_FF3] + s_2*BPW[FF2] );\n// For MoE the experts dominate (f_ffn>0.9) so effective_bpw ~= s_13*BFP4 + s_2*BFP8 ~= 0.73 B/param.\n// For dense (Llama/Qwen8B) f_ffn~0.75-0.80 -> effective_bpw ~= 0.8-0.9 B/param.\n\n// total weight bytes (whole model). If you keep a single global quant slider, override per-tensor BPW with that quant.\nweights_total_bytes = paramsTotalB * 1e9 * effective_bpw_decoder;   // decoder weights\n// (optional refinement: split out embedding+lmHead params at BF16; small for big models, ~few % for tiny ones)\n\n// ---- 2. KV CACHE BYTES (FIXED TOKEN BUDGET, BFP8) ----\nconst KV_BPE = 1.0625;            // ttnn.bfloat8_b default (1 mantissa byte/elem + 1 shared-exp byte / 16 elems)\nconst BLOCK_SIZE = 64;            // operative paged-attn page (model_spec block_size=\"64\"; LOW-confidence as a hard source constant)\nS = maxNumSeqs;                   // vLLM --max-num-seqs (batch)\nT = maxTokensAllUsersOverride ?? min(maxModelLen, FALLBACK=131072);  // FIXED budget, NOT user context (see resolution table in dataFields)\n// per-user worst-case padding (worker.py): one extra block_size per concurrent user\nnum_blocks = ceil( (T + BLOCK_SIZE * S) / BLOCK_SIZE );\n// per-layer KV tensor shape = (num_blocks, kv_heads_per_dev, BLOCK_SIZE, headDim), x2 for K and V.\n// KV is pre-sliced by n_local_kv_heads then ReplicateTensorToMesh, so per-chip holds only its head slice:\nND = numChips / ttDataParallel;                              // devices per DP submesh\nkv_heads_per_dev = numKvHeads / min(ND, numKvHeads);         // TP head sharding; floors at 1 KV head\nkv_bytes_per_chip = num_blocks * kv_heads_per_dev * BLOCK_SIZE * headDim * KV_BPE * numLayers * 2;\n// NOTE for non-GQA-uniform architectures (MLA/SWA/hybrid/compressed): keep the calculator's existing per-arch\n//   per-token-per-layer element count, but (a) substitute KV_BPE=1.0625, (b) size to T tokens (rounded to num_blocks*BLOCK_SIZE)\n//   instead of contextLength, (c) divide the head/KV dimension by min(ND, kvHeadEquivalent). The token-budget and BFP8\n//   substitutions are the TT-specific corrections; the per-arch geometry is unchanged.\n\n// ---- 3. PER-CHIP WEIGHT SHARDING (replicated norm fraction) ----\n// Everything sharded EXCEPT RMSNorm/LayerNorm weights (ReplicateTensorToMesh) -> on EVERY chip.\nconst REPLICATED_WEIGHT_FRACTION_TT = 0.005;   // norms only; ~0.3-0.8% of params. Use 0.005 (was 0.03 generic - too high for TT).\nr = (numChips > 1) ? REPLICATED_WEIGHT_FRACTION_TT : 0;\nweights_per_chip = weights_total_bytes * ( (1 - r)/numChips + r );\n// (Galaxy 8x4: weights are 2D-sharded across rows*cols=32, embeddings/norms replicate across the 8 rows;\n//  the (1-r)/numChips term already captures the dominant /32 split; r covers the replicated norms.)\n\n// ---- 4. ACTIVATIONS / PREFILL WORKSPACE (DRAM, per chip) ----\n// Decode activations live in L1 SRAM (NOT DRAM) -> ~0 to DRAM budget.\n// Prefill activations live in DRAM, bounded by chunk_tokens (NOT full seq_len):\nchunk_tokens = min(maxModelLen, max_prefill_chunk_size);     // max_prefill_chunk_size = div1024_entry*1024 (default 4096); per (model,device) table\nk = 3;  // ~2-4 live tensors (residual + MLP intermediate + transient SDPA); INFERRED, not a source constant\nact_bpe = 2;  // bf16 worst case (QKV path); SDPA/wo path is bf8_b=1 -> this is an upper bound\nprefill_act_per_chip = k * chunk_tokens * max(hiddenSize, intermediateSize) * act_bpe / max(1, ND);\n// This is tens-to-low-hundreds of MB; dwarfed by weights+KV. Treat as a per-chip workspace add, sharded by ND.\n\n// ---- 5. USABLE DRAM PER CHIP (allocator-accurate) ----\n// usable_per_bank = dram_view_size - dram_unreserved_base - align(traceRegionBytes, dram_alignment)\n// WH: num_views=12, dram_view_size=1073741824, unreserved_base=1048640, align=32\n// BH: num_views=8,  dram_view_size=4278190080, unreserved_base=1048704, align=64\nusable_dram_per_chip = num_views * ( dram_view_size - dram_unreserved_base - alignUp(traceRegionBytes, dram_alignment) );\n//   WH trace=0 -> 12 * (1073741824 - 1048640)        = 12,872,318,208 B = 11.988 GiB\n//   BH trace=0 -> 8  * (4278190080 - 1048704)         = 34,217,131,008 B = 31.867 GiB\n// trace is subtracted from EVERY bank: total trace cost = align(traceRegionBytes)*num_views.\n// (optional +256 MiB/bank only if TT_METAL_DRAM_BACKED_CQ=1; default OFF -> omit.)\n\n// ---- 6. FIT CHECK (per chip is the binding constraint) ----\nper_chip_required = weights_per_chip + kv_bytes_per_chip + prefill_act_per_chip;   // bytes\nutilization = per_chip_required / usable_dram_per_chip;\nverdict = utilization > 1 ? 'wont-fit' : utilization > 0.9 ? 'tight' : 'fits';\n// Aggregate view (for the UI bar) = per_chip_required * numChips, usable = usable_dram_per_chip * numChips.\n// The VERDICT must come from the PER-CHIP ratio, never the aggregate ratio.",
+      "dataFields": [
+        {
+          "field": "arch",
+          "appliesTo": "HardwareSpec (TT SKUs only)",
+          "value": "'WH' | 'BH' — selects the usable-DRAM constant set (num_views/dram_view_size/dram_unreserved_base/dram_alignment). WH for Wormhole (n150/n300/T3K/QuietBox-WH/Galaxy-WH), BH for Blackhole (p150a/QB2/LoudBox-BH/Galaxy-BH)."
+        },
+        {
+          "field": "usableDramPerChipBytes",
+          "appliesTo": "HardwareSpec (TT)",
+          "value": "Precomputed usable DRAM per chip at trace=0: WH=12872318208 (11.988 GiB), BH=34217131008 (31.867 GiB). NOTE this is LESS than the marketed memoryPerChipGb (12 / 32) — the existing memoryPerChipGb*GIB is the wrong cap. Subtract trace per the formula."
+        },
+        {
+          "field": "numViews",
+          "appliesTo": "HardwareSpec (TT)",
+          "value": "WH=12, BH=8 (DRAM views the allocator budgets per chip). Needed to apply per-bank trace subtraction."
+        },
+        {
+          "field": "dramViewSizeBytes",
+          "appliesTo": "HardwareSpec (TT)",
+          "value": "WH=1073741824 (1 GiB/view), BH=4278190080 (3.984 GiB/view). Use dram_view_size, NEVER the physical 2 GiB controller dram_bank_size on WH."
+        },
+        {
+          "field": "dramUnreservedBaseBytes",
+          "appliesTo": "HardwareSpec (TT)",
+          "value": "WH=1048640, BH=1048704 (~1.0 MiB/view: barrier + device-print-dispatch; profiler=0 release, CQ=0 default)."
+        },
+        {
+          "field": "dramAlignmentBytes",
+          "appliesTo": "HardwareSpec (TT)",
+          "value": "WH=32, BH=64 (used to align traceRegionBytes before subtraction)."
+        },
+        {
+          "field": "meshShape",
+          "appliesTo": "HardwareSpec (TT)",
+          "value": "[rows,cols]: N150=[1,1], N300=[1,2], T3K=[1,8], QuietBox-WH=[1,8], Galaxy=[8,4], p150a=[1,1], QB2-BH=[1,2-or-4], LoudBox-BH=[1,8]. cols is the TP shard dim; Galaxy rows=DP groups. (numChips already exists.)"
+        },
+        {
+          "field": "ttDataParallel",
+          "appliesTo": "CalcConfig / HardwareSpec (TT)",
+          "value": "tt_data_parallel replica count; default 1; Galaxy serving uses 4 (32 chips = 4 DP x 8 TP). Drives ND = numChips/ttDataParallel for KV head-sharding and the token-budget override key devices_per_dp_cache."
+        },
+        {
+          "field": "traceRegionBytes",
+          "appliesTo": "model_spec entry (per model+device)",
+          "value": "From release_model_spec.json override_tt_config.trace_region_size; 0 if absent. Examples: Qwen3-32B T3K=54000000, qwen3_32b_galaxy=184915840, gpt-oss-120b=134217728, Qwen3-8B N150=51000000/N300=65000000, P150X8=61341696, P300X2=402653184. Subtracted from EVERY DRAM bank."
+        },
+        {
+          "field": "maxNumSeqs",
+          "appliesTo": "model_spec entry / CalcConfig (TT)",
+          "value": "vLLM --max-num-seqs (batch S). From release_model_spec.json max_num_seqs (mostly string '32', sometimes int 8/32). Adds per-user KV padding block_size*S and is the concurrency cap. Parser must coerce string|int."
+        },
+        {
+          "field": "maxTokensAllUsers",
+          "appliesTo": "model_spec entry / derived (TT)",
+          "value": "FIXED KV token budget T. Resolution: per-(model,device) code override if matches (Llama-3.1-8B/Qwen3-8B @1dev WH=32768; DeepSeek-R1-Distill-Qwen-14B/Qwen2.5-14B @2dev=65536; Mistral-7B @1dev=65536; gemma-3-4b @1-2dev=65536; Llama-3.2-90B @8dev=65536) keyed by devices_per_dp_cache=numChips/ttDataParallel & is_wormhole; ELSE spec max_num_batched_tokens(==max_model_len); ELSE 131072. KV is sized to THIS, not user context."
+        },
+        {
+          "field": "blockSize",
+          "appliesTo": "model_spec entry (TT)",
+          "value": "Paged-attn page = 64 for every entry in release 0.15.0 (string '64'). LOW-confidence as a hard source constant (comes from vLLM CacheConfig, not pinned in plugin); use 64."
+        },
+        {
+          "field": "maxModelLen",
+          "appliesTo": "model_spec entry (TT)",
+          "value": "Per-request context cap (string in spec, coerce). Caps usable context; also = max_num_batched_tokens (prefill is one full context). Use as the context ceiling and the chunk-size cap input."
+        },
+        {
+          "field": "intermediateSize",
+          "appliesTo": "ModelSpec",
+          "value": "FFN d_ff (per-expert for MoE). Needed to compute f_attn/f_ffn weight split for effective_bpw and the prefill activation bound. Currently absent — add from HF config (intermediate_size / moe_intermediate_size)."
+        },
+        {
+          "field": "numAttnHeads",
+          "appliesTo": "ModelSpec.attention (gqa)",
+          "value": "Number of query heads (d_q = numAttnHeads*headDim). Needed for s_qkv attention sub-share. GqaAttention currently only stores numKvHeads; add numAttnHeads (or numHeads)."
+        },
+        {
+          "field": "ffnGated",
+          "appliesTo": "ModelSpec",
+          "value": "true for SwiGLU/gated FFN (3 matrices, s_13=2/3 s_2=1/3); false for non-gated (2 matrices, 1/2 1/2). Default true for modern Llama/Qwen/Gemma/Mistral/GLM/DeepSeek."
+        },
+        {
+          "field": "numExperts",
+          "appliesTo": "ModelSpec (moe)",
+          "value": "Total experts (ALL resident in DRAM; n_active is runtime-only and does NOT reduce memory). ffnParamsPerLayer = numExperts*(gated?3:2)*hidden*moeIntermediate. Needed so MoE f_ffn>0.9 dominates effective_bpw."
+        },
+        {
+          "field": "perTensorBpw / precisionProfile",
+          "appliesTo": "QuantScheme (new TT-native profile) / CalcConfig",
+          "value": "A TT precision profile object: {WQKV:1.0625, WO:1.0625, FF1_FF3:0.5625, FF2:1.0625, KV:1.0625} for 'performance' (DEFAULT). 'accuracy' variant: >=70B keep FF1_FF3=0.5625 else FF1_FF3=1.0625; Llama-3/Mistral/Phi keep attn=1.0625 else attn=2.0. GPT-OSS: experts ~0.55 (MXFP4), attn bf16/bfp8. Replaces the single bitsPerWeight for the TT path."
+        },
+        {
+          "field": "replicatedWeightFractionTT",
+          "appliesTo": "constant / FrameworkSpec(tt-metal)",
+          "value": "0.005 (norms only). The existing generic REPLICATED_WEIGHT_FRACTION=0.03 is too high for TT (only RMSNorm replicates; attn/MLP/lm_head/embedding all shard). Use a TT-specific 0.005."
+        },
+        {
+          "field": "maxPrefillChunkSizeDiv1024",
+          "appliesTo": "model_spec/per (model,device) (TT)",
+          "value": "Caps prefill activation DRAM. chunk_tokens=div1024*1024. e.g. Llama-3.1-8B {N150:4,N300:64,T3K:128,Galaxy:128}; Llama-3.1-70B {T3K:32,Galaxy:128}; Qwen2.5-72B {T3K:16}; default 4 (=4096) on unknown. Optional refinement; activations are small."
+        },
+        {
+          "field": "kvBytesDefault (override for tt-metal)",
+          "appliesTo": "FrameworkSpec(tt-metal)",
+          "value": "Keep 1.0625 (bfloat8_b). Already correct in frameworks.ts. Confirmed: 1 mantissa byte/elem + 1 shared-exp byte per 16 elems = 17/16."
+        },
+        {
+          "field": "supportedConfigs / status",
+          "appliesTo": "model_spec gating (TT)",
+          "value": "Release 0.15.0 has only: openai/gpt-oss-20b, gpt-oss-120b, arcee-ai/AFM-4.5B, google/gemma-3-1b-it, Qwen/Qwen3-8B, Qwen3-32B, QwQ-32B, mistralai/Mistral-7B-Instruct-v0.3 across device_type {N150,N300,T3K,GALAXY,GALAXY_T3K,P300,P150X8,P300X2}. NO Llama models. Flag (model,device) pairs absent from spec as 'not in this release'. Note duplicate (Qwen3-32B,GALAXY) keys distinguished by status COMPLETE vs FUNCTIONAL."
+        }
+      ],
+      "constants": [
+        {
+          "name": "BPW_BFP4",
+          "value": "0.5625 (= 9/16; DERIVED from 16-elem shared-exponent block-float tile, not a source constant but format-standard)"
+        },
+        {
+          "name": "BPW_BFP8",
+          "value": "1.0625 (= 17/16; 16 mantissa bytes + 1 shared-exponent byte per 16-elem tile-face row)"
+        },
+        {
+          "name": "BPW_BF16",
+          "value": "2.0"
+        },
+        {
+          "name": "KV_BYTES_PER_ELEM",
+          "value": "1.0625 (ttnn.bfloat8_b default KV dtype when no optimization override; allocate_vllm_kv_cache_per_layer)"
+        },
+        {
+          "name": "BLOCK_SIZE",
+          "value": "64 (paged-attention page in tokens; operative in release_model_spec.json but LOW-confidence as a hard-pinned source constant)"
+        },
+        {
+          "name": "FALLBACK_MAX_TOKENS_ALL_USERS",
+          "value": "131072 (models/common/model_capabilities.py FALLBACK_MAX_TOKENS_ALL_USERS = 131_072)"
+        },
+        {
+          "name": "KV_TENSORS_PER_LAYER",
+          "value": "2 (separate K and V tensors per layer)"
+        },
+        {
+          "name": "WH_NUM_DRAM_VIEWS",
+          "value": "12 (wormhole_b0_80_arch.yaml; 6 controllers x 2 views)"
+        },
+        {
+          "name": "WH_DRAM_VIEW_SIZE",
+          "value": "1073741824 bytes (1 GiB; == MEM_DRAM_SIZE; use this NOT the 2 GiB physical dram_bank_size)"
+        },
+        {
+          "name": "WH_DRAM_UNRESERVED_BASE",
+          "value": "1048640 bytes (barrier 32 + 0 profiler + device-print-dispatch 1048608 + 0 CQ)"
+        },
+        {
+          "name": "WH_DRAM_ALIGNMENT",
+          "value": "32 bytes"
+        },
+        {
+          "name": "WH_USABLE_PER_CHIP_TRACE0",
+          "value": "12872318208 bytes = 11.988 GiB (12 x (1073741824 - 1048640))"
+        },
+        {
+          "name": "BH_NUM_DRAM_VIEWS",
+          "value": "8 (blackhole_140_arch.yaml)"
+        },
+        {
+          "name": "BH_DRAM_VIEW_SIZE",
+          "value": "4278190080 bytes (3.984 GiB; == MEM_DRAM_SIZE)"
+        },
+        {
+          "name": "BH_DRAM_UNRESERVED_BASE",
+          "value": "1048704 bytes (barrier 64 + 0 profiler + device-print-dispatch 1048640 + 0 CQ)"
+        },
+        {
+          "name": "BH_DRAM_ALIGNMENT",
+          "value": "64 bytes"
+        },
+        {
+          "name": "BH_USABLE_PER_CHIP_TRACE0",
+          "value": "34217131008 bytes = 31.867 GiB (8 x (4278190080 - 1048704))"
+        },
+        {
+          "name": "TRACE_REGION_SIZE_DEFAULT",
+          "value": "0 (subtracted per-bank: total = align(trace, dram_alignment) x num_views; per-model overrides 50-402 MB in release_model_spec.json)"
+        },
+        {
+          "name": "DRAM_BACKED_CQ_SIZE",
+          "value": "0 default (TT_METAL_DRAM_BACKED_CQ=false; would add 1<<28 = 268435456 bytes/bank if enabled — omit)"
+        },
+        {
+          "name": "REPLICATED_WEIGHT_FRACTION_TT",
+          "value": "0.005 (RMSNorm-only replication; replaces generic 0.03 for TT)"
+        },
+        {
+          "name": "S_FFN_GATED_FF13",
+          "value": "2/3 (FF1+FF3 share of gated/SwiGLU MLP params)"
+        },
+        {
+          "name": "S_FFN_GATED_FF2",
+          "value": "1/3 (FF2/down share of gated MLP params)"
+        },
+        {
+          "name": "MAX_QKV_MM_SEQ_LEN",
+          "value": "2048 (prefill QKV tile-reshape threshold; affects activation tiling, not allocation size)"
+        },
+        {
+          "name": "PREFILL_LEN_CUTOFF",
+          "value": "1024 Wormhole / 512 Blackhole (MLP prefill reshape threshold)"
+        },
+        {
+          "name": "MAX_PREFILL_CHUNK_DEFAULT_DIV1024",
+          "value": "4 (=> 4096 tokens; fallback chunk size when (model,device) not in MAX_PREFILL_CHUNK_SIZES_DIV1024)"
+        },
+        {
+          "name": "MAX_BATCHED_PREFILL_SEQ_LEN",
+          "value": "131072 (=128*1024; caps batched-prefill token product, bounding multi-user prefill activation)"
+        },
+        {
+          "name": "MAX_TOKENS_OVERRIDES",
+          "value": "Llama-3.1-8B/Qwen3-8B @1dev WH=32768; DeepSeek-R1-Distill-Qwen-14B/Qwen2.5-14B @2dev=65536; Mistral-7B @1dev=65536; gemma-3-4b @1-2dev=65536; Llama-3.2-90B @8dev=65536; else 131072 (keyed by devices_per_dp_cache=numChips/ttDataParallel & is_wormhole_b0)"
+        }
+      ],
+      "implementationNotes": "SCOPE: this replaces ONLY the Tenstorrent branch of estimateVram. Non-TT hardware keeps the current flat/per-device path. Gate on hardware.vendor==='Tenstorrent' (or a new arch field).\n\n1. THE BINDING CONSTRAINT IS PER-CHIP, NOT AGGREGATE. The current code computes utilization = perDeviceGb / usablePerDeviceGb but for TT sets usablePerDeviceGb from the WRONG number (memoryGb / chips, i.e. marketed 12/32 GB). Two fixes: (a) usable = usableDramPerChipBytes (11.988 GiB WH / 31.867 GiB BH at trace=0, minus aligned trace), NOT 12/32; (b) the existing REPLICATED_WEIGHT_FRACTION=0.03 over-penalizes TT — use 0.005 (only RMSNorm replicates; attn/MLP/lm_head/embedding all shard). Keep returning the aggregate bar for the UI but derive the verdict from the per-chip ratio.\n\n2. WEIGHTS: replace the single quant.bitsPerWeight with a mixed-precision effective_bpw computed from per-tensor BPW (performance profile default) and a param split derived from model dims (f_attn/f_ffn, s_qkv/s_wo, s_13/s_2). This needs three NEW ModelSpec fields: intermediateSize, numAttnHeads, ffnGated (+ numExperts for MoE). For MoE the experts dominate so effective_bpw collapses to ~ (2/3)*0.5625 + (1/3)*1.0625 = 0.729 B/param regardless of attention. For dense ~0.8-0.9. This is MUCH lower than the current bf16/2-byte or generic-int4 assumption and is the single biggest correction (a 7B dense model is ~6-7 GB of weights here, not 16 GB). Let the user still override with a global quant if desired, but default to the performance profile.\n\n3. KV IS SIZED TO A FIXED TOKEN BUDGET T, NOT THE CONTEXT SLIDER. This is the second-biggest behavioral change: dragging the context slider does NOT change TT KV memory (it is pre-allocated to max_tokens_all_users). num_blocks = ceil((T + 64*S)/64). Use the override resolution order in the dataFields. The context slider should instead be capped/validated against maxModelLen and surfaced as an assumption ('TT pre-allocates KV to a fixed budget of T tokens shared across up to S users; per-user context is capped at maxModelLen'). KV dtype is BFP8 (1.0625), already correct in frameworks.ts.\n\n4. KV SHARDING: kv_heads_per_dev = numKvHeads / min(ND, numKvHeads) where ND = numChips/ttDataParallel. For GQA models with few KV heads (e.g. numKvHeads=8 on T3K with 8 chips) this floors at 1 head/chip and adding chips beyond numKvHeads does NOT further reduce per-chip KV. Multiply per-layer KV by 2 (K+V). For MLA/SWA/hybrid/compressed, reuse the calculator's existing per-arch element counts but (a) swap KV_BPE to 1.0625, (b) size to num_blocks*BLOCK_SIZE tokens (T budget) not contextLength, (c) divide the KV dimension by min(ND, kvHeadEquivalent).\n\n5. ACTIVATIONS are a small per-chip DRAM workspace bounded by chunk_tokens=min(maxModelLen, max_prefill_chunk_size), NOT full context (internal chunked prefill). Decode activations are in L1 SRAM and contribute ~0 to DRAM. prefill_act_per_chip = k*chunk_tokens*max(hidden,intermediate)*2/ND with k~3. Keep the existing activation 'estimate' assumption flag; this term is tens-to-low-hundreds MB and rarely decides the verdict.\n\n6. TRACE OVERHEAD: subtract align(traceRegionBytes, dram_alignment) from EACH of num_views banks => total trace cost = aligned_trace * num_views (e.g. T3K Qwen3-32B 54MB -> 0.60 GiB total). traceRegionBytes comes from the per-(model,device) model_spec entry; 0 if absent. The current frameworks.tt-metal baselineOverheadGb=0.3 is a rough stand-in — replace with the proper unreserved_base (~1 MiB/bank, already folded into usableDramPerChipBytes) plus this trace term. Do NOT double-count: unreserved_base is already inside usableDramPerChipBytes.\n\n7. GPT-OSS SPECIAL CASE: bypasses DecodersPrecision entirely (optimizations forced None); experts ship MXFP4 (~0.5-0.55 B/param), attention bf16/bfp8. Model it with a per-model precision override (~0.55 effective expert bpw) rather than the performance table.\n\n8. DEVICE/MESH MAPPING for the SKUs already in hardware.ts: tt-n150 numChips=1 mesh[1,1]; tt-n300=2 [1,2]; tt-t3k & tt-qb-wh=8 [1,8]; tt-galaxy-wh=32 [8,4] ttDataParallel=4; tt-p150a=1 [1,1] BH; tt-qb2-bh=4 BH; tt-loudbox-bh=8 BH; tt-galaxy-bh=32 BH. Set arch per Wormhole vs Blackhole.\n\n9. RELEASE GATING (optional but recommended): release 0.15.0 supports only 8 repos and a fixed device set; (model,device) pairs outside it should be flagged 'not in this release spec' even if the math fits, because tt-inference-server won't serve them.\n\nTEST EXPECTATIONS (sanity): Qwen3-8B on N300 (2 chips, ND=2, T=32768 override, S=32, 36 layers, 8 kv heads->4/chip, headDim128): weights ~8.2e9*~0.85 ~7 GB total -> ~3.5 GB/chip; KV num_blocks=ceil((32768+64*32)/64)=ceil(34816/64)=544 blocks; per-chip KV=544*4*64*128*1.0625*36*2 ~ 13.6 GB/chip -> EXCEEDS 11.988 GiB usable => 'wont-fit' or 'tight'. (This is exactly the kind of multi-chip realism the flat aggregate model misses; verify against the spec min_ram_gb=20 for N300 which implies ~10 GB/chip headroom, so the calculator's T override and head-sharding must be exact — flagged for calibration.)",
+      "residualUncertainties": [
+        "BLOCK_SIZE=64 is operative (every release_model_spec.json entry) but NOT pinned by a plugin constant — it comes from vLLM CacheConfig/engine args. platform.py has no block_size assignment. Treat 64 as operative-but-unconfirmed.",
+        "Block-float byte costs (BFP8=1.0625, BFP4=0.5625, BF16=2.0) are DERIVED from the documented 16-element shared-exponent tile, NOT verbatim source constants (grep for 0.5625/1.0625/9/16/17/16 in tt-metal returned nothing). Mathematically standard but flagged.",
+        "The weight param split (s_qkv/s_wo, s_13/s_2, f_attn/f_ffn) is computed from model dims, not stored in source. Requires intermediateSize/numAttnHeads/ffnGated/numExperts to be added per model and assumes SwiGLU 3-matrix FFN (2/3 vs 1/3). Non-gated or fused-gate models deviate.",
+        "GPT-OSS expert MXFP4 byte cost (~0.5-0.55 B/param) is inferred from the MXFP4 format, not emitted by the DecodersPrecision tables (GPT-OSS bypasses them). Low confidence on the exact value.",
+        "Per-decoder JSON overrides (performance_decoder_config.json / accuracy_decoder_config.json under model_params/<model>/) can make individual layers deviate from the uniform performance profile. Not enumerated; assumed uniform.",
+        "Whether the runtime actually uses the code override (e.g. Qwen3-8B N150=32768) vs the model_spec max_num_batched_tokens (=40960) as max_tokens_all_users was not traced end-to-end — they can disagree. The override resolution order is best-effort; calibrate against observed min_ram_gb.",
+        "GALAXY data_parallel_size=4: whether max_num_seqs and the token budget are per-replica or aggregate across the 4 DP groups is unconfirmed; affects whether to divide S/T by ttDataParallel.",
+        "The activation constant k (~2-4) and act_bpe (1 vs 2) are inferred, not measured; SDPA scratch is allocator-internal. Activation term is small so this rarely changes the verdict.",
+        "GQA QKV over-replication when numKvHeads < numChips: the wqkv tensor is sharded by num_devices but Q heads may be broadcast for GQA, potentially raising per-chip KV/weights slightly beyond the naive /min(ND,kvHeads). Not fully confirmed from source.",
+        "Blackhole token-budget overrides: all get_max_tokens_all_users overrides are gated by is_wormhole_b0(); BH SKUs fall through to 131072 (or spec max_model_len). Whether BH has its own overrides was not found.",
+        "release_model_spec.json stores numeric fields inconsistently (strings vs ints; duplicate (Qwen3-32B,GALAXY) keys by status). Parser must coerce and handle duplicates.",
+        "Embedding/lm_head dtype: assumed BF16 (2 B/param) and a small share for large models; for tiny models (<2B) this is a meaningful fraction and the effective_bpw could be underestimated. Not separately split in the proposed formula (folded into decoder bpw)."
+      ]
+    }
+  }
+}

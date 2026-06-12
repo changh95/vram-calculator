@@ -1,0 +1,103 @@
+@import 'tailwindcss';
+
+/*
+ * Design language: engineering instrument / datasheet.
+ * Graphite-blue ground, phosphor-amber instrumentation, hairline rules.
+ * Verdict colors (green/amber/red) are reserved exclusively for the verdict
+ * and the utilization gauge — never decoration.
+ */
+@theme {
+  --font-display: 'Martian Mono', ui-monospace, monospace;
+  --font-body: 'Saira', system-ui, sans-serif;
+
+  --color-ground: var(--ground);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-edge: var(--edge);
+  --color-ink: var(--ink);
+  --color-ink-dim: var(--ink-dim);
+  --color-ink-faint: var(--ink-faint);
+  --color-accent: var(--accent);
+
+  --color-fit: var(--fit);
+  --color-tight: var(--tight);
+  --color-nofit: var(--nofit);
+
+  --color-seg-weights: var(--seg-weights);
+  --color-seg-kv: var(--seg-kv);
+  --color-seg-act: var(--seg-act);
+  --color-seg-ovh: var(--seg-ovh);
+}
+
+:root {
+  --ground: #0b0e14;
+  --panel: #11151d;
+  --panel-2: #161b26;
+  --edge: #232a38;
+  --ink: #e8ecf3;
+  --ink-dim: #97a1b3;
+  --ink-faint: #5c6678;
+  --accent: #ffb454;
+
+  --fit: #4cc38a;
+  --tight: #e5b454;
+  --nofit: #f0635c;
+
+  --seg-weights: #6e93cb;
+  --seg-kv: #a98fd6;
+  --seg-act: #5cb3a5;
+  --seg-ovh: #79808d;
+}
+
+[data-theme='light'] {
+  --ground: #f3f1ec;
+  --panel: #fcfbf8;
+  --panel-2: #efede7;
+  --edge: #d8d4ca;
+  --ink: #1d2127;
+  --ink-dim: #5a6170;
+  --ink-faint: #9aa0ab;
+  --accent: #b2700f;
+
+  --fit: #1e8a5a;
+  --tight: #a87514;
+  --nofit: #c2342d;
+
+  --seg-weights: #4a72ad;
+  --seg-kv: #7e5cb8;
+  --seg-act: #2f8d7d;
+  --seg-ovh: #6e7582;
+}
+
+html {
+  background: var(--ground);
+}
+
+body {
+  font-family: var(--font-body);
+  color: var(--ink);
+  /* faint blueprint grid */
+  background-image:
+    linear-gradient(var(--edge) 1px, transparent 1px),
+    linear-gradient(90deg, var(--edge) 1px, transparent 1px);
+  background-size: 28px 28px;
+  background-position: -1px -1px;
+}
+
+@layer utilities {
+  .font-display {
+    font-family: var(--font-display);
+    font-variant-numeric: tabular-nums;
+  }
+  /* diagonal hatching for the overflow region of the gauge */
+  .hatch-overflow {
+    background-image: repeating-linear-gradient(
+      -45deg,
+      var(--nofit) 0 4px,
+      transparent 4px 9px
+    );
+  }
+  .panel-rule {
+    border: 1px solid var(--edge);
+  }
+}
