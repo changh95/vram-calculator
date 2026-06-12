@@ -3,7 +3,7 @@ import type { ConfigSelection } from '../urlState'
 export { MODELS } from './models'
 export { HARDWARE } from './hardware'
 export { FRAMEWORKS } from './frameworks'
-export { QUANTS } from './quants'
+export { QUANTS, TT_QUANTS } from './quants'
 
 /**
  * Opening state — never blank (design requirement). A 9B-class model on a

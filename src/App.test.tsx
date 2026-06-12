@@ -100,6 +100,22 @@ describe('App', () => {
     expect(screen.queryByRole('link', { name: /buy now/i })).not.toBeInTheDocument()
   })
 
+  it('changing quantization on a Tenstorrent device changes the memory results', async () => {
+    render(<App />) // default is Blackhole p150a (Tenstorrent)
+    await userEvent.selectOptions(screen.getByLabelText(/Hardware/), 'tt-p150a')
+    const before = screen.getByTestId('total-required').textContent
+    await userEvent.selectOptions(screen.getByLabelText('Quantization'), 'tt-accuracy')
+    expect(screen.getByTestId('total-required').textContent).not.toBe(before)
+  })
+
+  it('changing quantization on a GPU device changes the memory results', async () => {
+    render(<App />)
+    await userEvent.selectOptions(screen.getByLabelText(/Hardware/), 'rtx-4090')
+    const before = screen.getByTestId('total-required').textContent
+    await userEvent.selectOptions(screen.getByLabelText('Quantization'), 'q8_0')
+    expect(screen.getByTestId('total-required').textContent).not.toBe(before)
+  })
+
   it('shows the unified-memory cap note for an Apple device', async () => {
     render(<App />)
     await userEvent.selectOptions(screen.getByLabelText(/Hardware/), 'm4-max')

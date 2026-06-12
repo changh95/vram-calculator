@@ -58,6 +58,29 @@ negligible. Firmware/kernels live in on-chip SRAM (108 MB WH / 180 MB BH),
 
 **Replication**: only RMSNorm weights use `ReplicateTensorToMesh`; attention/MLP/embeddings/lm_head all shard → `REPLICATED_WEIGHT_FRACTION_TT = 0.005` (vs the generic 0.03).
 
+## Precision profile is user-selectable
+
+On TT hardware the app's **Quantization control selects the block-float profile**
+(GPU quant formats like GGUF/AWQ don't apply on TT):
+- **Performance** (default): BFP8 attention + BFP4 MLP → ~0.73 (MoE) / ~0.85
+  (dense) B/param, BFP8 KV.
+- **Accuracy**: more BF16 (attention + KV) → ~1.0 (MoE) / ~1.2 (dense) B/param,
+  BF16 KV. Heavier, higher-fidelity.
+
+## MoE experts are fully resident — no dynamic/host loading
+
+Verified across GPT-OSS, DeepSeek-V3, Mixtral, and the generic
+`models/common/modules/moe` path plus the tt-vllm plugin (provenance:
+`notes/raw/tenstorrent-moe-loading-investigation.json`): **all routed MoE
+experts are loaded into device DRAM at init and stay resident.** There is NO
+host→device expert streaming/offload — nothing analogous to llama.cpp
+`--cpu-moe`. The only "streaming" is intra-device DRAM→L1 over the NoC (weights
+never leave DRAM); the "SRAM hot expert" feature is a DRAM→L1 latency cache, not
+a capacity reduction; tt-vllm exposes no `cpu_offload_gb`. Capacity scales by
+**adding chips**, never by host offload. So the calculator correctly counts
+100% of expert weights (block-float) as device-resident, sharded across the
+mesh — `paramsTotal × block-float-bpp`, not active-experts-only.
+
 ## Known limitations (disclosed in-app as assumptions)
 
 - The weight bpp is a **two-value estimate** (moe/dense), not a per-model

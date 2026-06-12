@@ -128,6 +128,16 @@ export interface QuantScheme {
   bitsPerWeight: number
   note?: string
   estimate?: boolean
+  /**
+   * Tenstorrent block-float profile (Performance / Accuracy). Used ONLY on the
+   * TT path, where weights run block-float regardless of GPU quant formats —
+   * these override bitsPerWeight there. Block-float B/param differs by MoE vs
+   * dense; KV dtype is part of the profile too. See notes/tenstorrent-memory.md.
+   */
+  ttWeightBppMoe?: number
+  ttWeightBppDense?: number
+  ttKvBytes?: number
+  ttKvLabel?: string
 }
 
 export interface HardwareSpec {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { FRAMEWORKS, HARDWARE, MODELS, QUANTS, DEFAULTS } from './index'
+import { FRAMEWORKS, HARDWARE, MODELS, QUANTS, TT_QUANTS, DEFAULTS } from './index'
 import { estimateVram, kvCacheBytes, GIB } from '../estimateVram'
 import type { CalcConfig } from '../types'
 
@@ -112,6 +112,14 @@ describe('added families — Llama 3 and DiffusionGemma', () => {
     expect(families).toContain('DiffusionGemma')
   })
 
+  it('includes the GPT-OSS family as interleaved-SWA MoE', () => {
+    const families = new Set(MODELS.map((m) => m.family))
+    expect(families).toContain('GPT-OSS')
+    const m = MODELS.find((x) => x.id === 'gpt-oss-20b')!
+    expect(m.moe).toBe(true)
+    expect(m.attention.kind).toBe('gqa-swa')
+  })
+
   it('DiffusionGemma reuses the Gemma 4 26B-A4B backbone (same KV geometry)', () => {
     const dg = MODELS.find((m) => m.id === 'diffusiongemma-26b-a4b')!
     const g4 = MODELS.find((m) => m.id === 'gemma4-26b-a4b')!
@@ -159,6 +167,17 @@ describe('QUANTS table', () => {
 
   it('includes the canonical anchor Q4_K_M', () => {
     expect(QUANTS.find((q) => q.id === 'q4_k_m')?.bitsPerWeight).toBeCloseTo(4.89, 2)
+  })
+
+  it('TT_QUANTS provide block-float profiles (performance + accuracy) with TT params', () => {
+    expect(TT_QUANTS.find((q) => q.id === 'tt-performance')).toBeDefined()
+    expect(TT_QUANTS.find((q) => q.id === 'tt-accuracy')).toBeDefined()
+    for (const q of TT_QUANTS) {
+      expect(q.ttWeightBppMoe!, q.id).toBeGreaterThan(0)
+      expect(q.ttWeightBppDense!, q.id).toBeGreaterThan(0)
+      expect(q.ttKvBytes!, q.id).toBeGreaterThan(0)
+      expect(q.ttKvLabel, q.id).toBeTruthy()
+    }
   })
 })
 

@@ -132,12 +132,19 @@ function ttKvShardCap(attn: AttentionConfig): number {
 }
 
 function estimateTenstorrent(config: CalcConfig): MemoryBreakdown {
-  const { model, hardware, deviceCount, contextLength, concurrentSequences } = config
+  const { model, quant, hardware, deviceCount, contextLength, concurrentSequences } = config
   const shards = (hardware.numChips ?? 1) * deviceCount
-  const bpp = model.moe ? TT_BYTES_PER_PARAM_MOE : TT_BYTES_PER_PARAM_DENSE
+  // Block-float profile from the selected quant's TT fields (Performance /
+  // Accuracy); falls back to the performance default when a GPU quant id is
+  // carried over from non-TT hardware.
+  const bpp = model.moe
+    ? (quant.ttWeightBppMoe ?? TT_BYTES_PER_PARAM_MOE)
+    : (quant.ttWeightBppDense ?? TT_BYTES_PER_PARAM_DENSE)
+  const kvBytes = quant.ttKvBytes ?? TT_KV_BYTES
+  const kvLabel = quant.ttKvLabel ?? 'BFP8 (bfloat8_b)'
 
   const weights = (model.paramsTotalB * 1e9 * bpp) / GIB
-  const kv = kvCacheBytes(model.attention, contextLength, concurrentSequences, TT_KV_BYTES) / GIB
+  const kv = kvCacheBytes(model.attention, contextLength, concurrentSequences, kvBytes) / GIB
   const activations = activationBytes(model.hiddenSize, contextLength, concurrentSequences, TT_ACTIVATION) / GIB
 
   const r = shards > 1 ? REPLICATED_WEIGHT_FRACTION_TT : 0
@@ -157,11 +164,11 @@ function estimateTenstorrent(config: CalcConfig): MemoryBreakdown {
   const assumptions: Assumption[] = [
     {
       id: 'tt-blockfloat',
-      text: `Tenstorrent runs mixed block-float weights (BFP8 attention + BFP4 MLP ≈ ${bpp} B/param) regardless of the selected quantization.`,
+      text: `Tenstorrent weights run block-float ≈ ${bpp} B/param (${quant.label}). "Performance" = BFP8 attention + BFP4 MLP; "Accuracy" keeps more in BF16. GPU quant formats (GGUF/AWQ) don't apply on TT.`,
     },
     {
       id: 'kv-dtype',
-      text: 'KV cache assumed BFP8 (bfloat8_b ≈ 1.06 B/elem) — the default "performance" profile. The "accuracy" profile and precision-sensitive models (e.g. Qwen2.5-7B) run BF16 KV (~2× larger); KV is usually a small share of TT memory, but this matters at long context or for replicated MLA KV.',
+      text: `KV cache assumed ${kvLabel}, set by the "${quant.label}" profile. KV is usually a small share of TT memory, but this matters at long context or for replicated MLA KV.`,
     },
     {
       id: 'tt-per-chip',

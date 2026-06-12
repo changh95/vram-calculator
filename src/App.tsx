@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { CONTEXT_PRESETS, DEFAULTS, FRAMEWORKS, HARDWARE, MODELS, QUANTS } from './lib/data'
+import { CONTEXT_PRESETS, DEFAULTS, FRAMEWORKS, HARDWARE, MODELS, QUANTS, TT_QUANTS } from './lib/data'
 import { estimateVram } from './lib/estimateVram'
 import { suggestFixes, type Suggestion } from './lib/suggestions'
 import { parseConfigSearch, serializeConfigSearch, type ConfigSelection } from './lib/urlState'
@@ -50,15 +50,28 @@ const QUANT_GROUP: SelectGroup[] = [
   { label: 'Precision', options: QUANTS.map((q) => ({ value: q.id, label: q.label, meta: `${q.bitsPerWeight} bpw` })) },
 ]
 
+// Tenstorrent runs block-float (not GGUF/AWQ), so TT hardware gets its own
+// precision profiles instead of the GPU quant ladder.
+const QUANT_GROUP_TT: SelectGroup[] = [
+  { label: 'Tenstorrent block-float', options: TT_QUANTS.map((q) => ({ value: q.id, label: q.label })) },
+]
+
 const FRAMEWORK_GROUP: SelectGroup[] = [
   { label: 'Framework', options: FRAMEWORKS.map((f) => ({ value: f.id, label: f.label })) },
 ]
 
 function resolve(sel: ConfigSelection): CalcConfig {
+  const hardware = byId(HARDWARE, sel.hardwareId, DEFAULTS.hardwareId)
+  // TT hardware uses block-float profiles; if a GPU quant id is carried over
+  // (or vice-versa), fall back to that list's default so the control is valid.
+  const tt = hardware.usableGbPerChip !== undefined
+  const quant = tt
+    ? byId(TT_QUANTS, sel.quantId, 'tt-performance')
+    : byId(QUANTS, sel.quantId, DEFAULTS.quantId)
   return {
     model: byId(MODELS, sel.modelId, DEFAULTS.modelId),
-    hardware: byId(HARDWARE, sel.hardwareId, DEFAULTS.hardwareId),
-    quant: byId(QUANTS, sel.quantId, DEFAULTS.quantId),
+    hardware,
+    quant,
     framework: byId(FRAMEWORKS, sel.frameworkId, DEFAULTS.frameworkId),
     deviceCount: sel.deviceCount,
     contextLength: sel.contextLength,
@@ -85,7 +98,12 @@ export default function App() {
   const config = useMemo(() => resolve(sel), [sel])
   const result = useMemo(() => estimateVram(config), [config])
   const suggestions = useMemo(
-    () => suggestFixes(config, { quants: QUANTS, hardware: HARDWARE, maxDevices: 8 }),
+    () =>
+      suggestFixes(config, {
+        quants: config.hardware.usableGbPerChip !== undefined ? TT_QUANTS : QUANTS,
+        hardware: HARDWARE,
+        maxDevices: 8,
+      }),
     [config],
   )
 
@@ -160,7 +178,13 @@ export default function App() {
                 )}
               </div>
               <div className="grid grid-cols-2 gap-4">
-                <SelectField label="Quantization" hint="bits / weight" groups={QUANT_GROUP} value={sel.quantId} onChange={(v) => set({ quantId: v })} />
+                <SelectField
+                  label="Quantization"
+                  hint={config.hardware.usableGbPerChip !== undefined ? 'block-float profile' : 'bits / weight'}
+                  groups={config.hardware.usableGbPerChip !== undefined ? QUANT_GROUP_TT : QUANT_GROUP}
+                  value={config.quant.id}
+                  onChange={(v) => set({ quantId: v })}
+                />
                 <SelectField label="Serving framework" hint="KV strategy" groups={FRAMEWORK_GROUP} value={sel.frameworkId} onChange={(v) => set({ frameworkId: v })} />
               </div>
               <ContextSlider label="Context length" presets={CONTEXT_PRESETS} value={sel.contextLength} onChange={(v) => set({ contextLength: v })} />

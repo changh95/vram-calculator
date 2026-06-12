@@ -126,6 +126,16 @@ Hybrids also carry a constant per-sequence SSM state (~15–402 MB, estimate).
 | Llama-3.3-70B | 70.6B | GQA (8kv·128) | 80 | 320 KiB | 128K |
 | Llama-3.1-405B | 405B | GQA (8kv·128) | 126 | 504 KiB | 128K |
 
+## GPT-OSS (OpenAI) — MoE, native MXFP4 experts, interleaved SWA
+
+| Model | Params | Layers | full / sliding (KV 8kv·64) | window | Ctx |
+|---|---|---|---|---|---|
+| gpt-oss-20b | 20.9B·A3.6B | 24 | 12 full / 12 sliding | 128 | 128K |
+| gpt-oss-120b | 116.8B·A5.1B | 36 | 18 full / 18 sliding | 128 | 128K |
+
+Experts ship MXFP4 (~4.25 bpw); attention/embeddings stay BF16 → whole-model
+effective ≈ 5.3 bpw (so MXFP4 quant underestimates total weights — pick ~Q5).
+
 ## Notes
 - Several families postdate the training cutoff and were web-verified: "Qwen3"
   current gen is **Qwen3.5/3.6**; **Gemma 4** shipped Mar/Jun 2026; **GLM-5/5.1**

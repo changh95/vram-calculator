@@ -86,3 +86,35 @@ export const QUANTS: QuantScheme[] = [
     estimate: true,
   },
 ]
+
+/**
+ * Tenstorrent block-float precision profiles, shown in place of the GPU quant
+ * ladder when a TT device is selected (TT runs block-float, not GGUF/AWQ). The
+ * profile sets both the weight B/param (MoE vs dense) and the KV dtype.
+ * Source: tt-metal DecodersPrecision (notes/tenstorrent-memory.md). `bitsPerWeight`
+ * is a nominal display value; the TT path uses the ttWeightBpp and ttKvBytes fields.
+ */
+export const TT_QUANTS: QuantScheme[] = [
+  {
+    id: 'tt-performance',
+    label: 'Block-float · performance',
+    bitsPerWeight: 6,
+    note: 'Default tt-metal profile: BFP8 attention + BFP4 MLP, BFP8 KV. The serving default.',
+    estimate: true,
+    ttWeightBppMoe: 0.73,
+    ttWeightBppDense: 0.85,
+    ttKvBytes: 1.0625,
+    ttKvLabel: 'BFP8 (bfloat8_b)',
+  },
+  {
+    id: 'tt-accuracy',
+    label: 'Block-float · accuracy',
+    bitsPerWeight: 9,
+    note: 'Accuracy profile: more BF16 (attention + KV), heavier but higher-fidelity.',
+    estimate: true,
+    ttWeightBppMoe: 1.0,
+    ttWeightBppDense: 1.2,
+    ttKvBytes: 2.0,
+    ttKvLabel: 'BF16',
+  },
+]

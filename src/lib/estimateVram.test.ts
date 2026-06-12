@@ -552,6 +552,23 @@ describe('estimateVram — Tenstorrent per-chip mesh model', () => {
     expect(r.kvCacheGb).toBeCloseTo(expectedKvTotal, 5) // 8 heads / 8 chips → aggregate == total
   })
 
+  it('the accuracy profile uses heavier weights and BF16 KV than performance', () => {
+    const perf = estimateVram(ttCfg(gqaModel, ttChip('t', 8), {
+      quant: { id: 'tt-performance', label: 'perf', bitsPerWeight: 6, ttWeightBppMoe: 0.73, ttWeightBppDense: 0.85, ttKvBytes: 1.0625, ttKvLabel: 'BFP8' },
+    }))
+    const acc = estimateVram(ttCfg(gqaModel, ttChip('t', 8), {
+      quant: { id: 'tt-accuracy', label: 'acc', bitsPerWeight: 9, ttWeightBppMoe: 1.0, ttWeightBppDense: 1.2, ttKvBytes: 2.0, ttKvLabel: 'BF16' },
+    }))
+    expect(acc.weightsGb).toBeGreaterThan(perf.weightsGb)
+    expect(acc.kvCacheGb).toBeGreaterThan(perf.kvCacheGb)
+  })
+
+  it('a GPU quant id carried onto TT falls back to the performance block-float profile', () => {
+    const r = estimateVram(ttCfg(gqaModel, ttChip('t', 8), { quant: { id: 'q4', label: 'q4', bitsPerWeight: 4.5 } }))
+    const perfExpected = ((8e9 * 0.85) / GIB) * (1 - 0.005 + 8 * 0.005)
+    expect(r.weightsGb).toBeCloseTo(perfExpected, 5)
+  })
+
   it('discloses block-float weights, per-chip sizing, and KV dtype', () => {
     const r = estimateVram(ttCfg(gqaModel, ttChip('t', 8)))
     expect(r.assumptions.some((a) => a.id === 'tt-blockfloat')).toBe(true)
